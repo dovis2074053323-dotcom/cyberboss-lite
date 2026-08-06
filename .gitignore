@@ -1,9 +1,23 @@
 node_modules/
 .DS_Store
 .env
+.env.*
 .mcp.json
 .claude/settings.json
 .claude/settings.local.json
 npm-debug.log*
 third_party/
 firmware/
+
+# Defense-in-depth: runtime state normally lives outside the repo entirely
+# (CYBERBOSS_STATE_DIR), but never let credentials/tokens/state land in git
+# even if that's misconfigured locally.
+*.credentials.json
+sender-allowlist.json
+weixin-config.json
+sessions.json
+accounts/
+sync-buffers/
+claude-cfg/
+/state/
+.cyberboss/
