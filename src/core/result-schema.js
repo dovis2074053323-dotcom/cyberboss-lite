@@ -303,7 +303,7 @@ function validateLoops(loops, turnUserText, errors) {
   }
 }
 
-function validateIntentions(intentions, errors) {
+function validateIntentions(intentions, turnUserText, errors) {
   if (!isPlainObject(intentions)) {
     fail(errors, "intentions", "must be an object");
     return;
@@ -327,6 +327,12 @@ function validateIntentions(intentions, errors) {
       }
       if (typeof item.sourceQuote !== "string" || !item.sourceQuote.trim()) {
         fail(errors, `${pathLabel}.sourceQuote`, "must be a non-empty string");
+      } else if (!turnUserText.includes(item.sourceQuote)) {
+        // Spec §6: "reminder 无明确用户请求时拒绝" — grounding every intention
+        // (not just reminder) in a verbatim quote from this turn's user text is
+        // the mechanical proxy for "the user actually asked for this," the same
+        // pattern already used for memory and loops.
+        fail(errors, `${pathLabel}.sourceQuote`, "must appear verbatim in this turn's user text");
       }
     });
   }
@@ -388,7 +394,7 @@ function validateStructuredResult(candidate, { turnUserText = "" } = {}) {
   validateStatePatch(candidate.statePatch, errors);
   validateMemory(candidate.memory, turnUserText, errors);
   validateLoops(candidate.loops, turnUserText, errors);
-  validateIntentions(candidate.intentions, errors);
+  validateIntentions(candidate.intentions, turnUserText, errors);
   validateHandoff(candidate.handoff, errors);
 
   return { valid: errors.length === 0, errors };

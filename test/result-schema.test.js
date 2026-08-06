@@ -116,6 +116,33 @@ test("rejects an unknown intention type", () => {
   assert.equal(result.valid, false);
 });
 
+// Spec §6/§9 test 11: "reminder 无明确用户请求时拒绝" — a reminder (or any
+// intention) whose sourceQuote isn't actually in what the user said this turn
+// is not grounded in an explicit request, and must be rejected the same way an
+// ungrounded memory/loop is.
+test("rejects a reminder whose sourceQuote is not verbatim in this turn's user text", () => {
+  const candidate = validResult({
+    intentions: {
+      create: [{ type: "reminder", reason: "喝水", sourceQuote: "提醒我喝水", dueAt: "2026-08-06T21:00:00+08:00" }],
+      resolve: [],
+    },
+  });
+  const result = validateStructuredResult(candidate, { turnUserText: "今天天气不错" });
+  assert.equal(result.valid, false);
+  assert.ok(result.errors.some((error) => error.includes("verbatim")));
+});
+
+test("accepts a reminder whose sourceQuote is verbatim in this turn's user text", () => {
+  const candidate = validResult({
+    intentions: {
+      create: [{ type: "reminder", reason: "喝水", sourceQuote: "提醒我喝水", dueAt: "2026-08-06T21:00:00+08:00" }],
+      resolve: [],
+    },
+  });
+  const result = validateStructuredResult(candidate, { turnUserText: "半小时后提醒我喝水" });
+  assert.equal(result.valid, true);
+});
+
 test("rejects a handoff missing required fields", () => {
   const candidate = validResult({ handoff: { summary: "s" } });
   const result = validateStructuredResult(candidate, { turnUserText: "hi" });

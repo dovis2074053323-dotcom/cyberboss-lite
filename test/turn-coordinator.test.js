@@ -228,6 +228,9 @@ test("a pending resume_topic shown this turn gets resolved after a successful ap
     agentName: "test", receivedAtIso: "2026-08-06T10:00:00.000Z", receivedAtLocal: "10:00", mergedText: "嗨",
   });
   assert.deepEqual(prepared.pendingResumeTopicIds, [intention.id]);
+  // Spec §9 test 12: resume_topic must actually be injected into the very next
+  // inbound turn's assembled context, not just tracked internally.
+  assert.match(prepared.turnText, /还没聊完的话题/);
 
   await coordinator.applyTurn({
     structuredResult: validResult({ reply: "嗨，我们接着聊" }),
@@ -256,4 +259,88 @@ test("check_in intentions are cancelled during prepareTurn simply because a real
 
   const finalState = stores.intentionsStore.load();
   assert.equal(finalState.intentions.find((i) => i.id === intention.id).status, "cancelled");
+});
+
+// Spec §9 test 3: a >=6h idle gap rolls the episode over exactly once, even
+// across repeated turns — the second turn's own lastTurnAt is now recent (from
+// the rollover), so it must not trigger a second rollover for the same gap.
+test("a 6h+ idle gap rolls the episode over exactly once, not once per subsequent turn", async () => {
+  const { config, stores, coordinator } = makeHarness();
+  const original = stores.episodeStore.ensureCurrent("2026-08-06T00:00:00.000Z");
+  const originalId = original.id;
+
+  const firstPrepared = await coordinator.prepareTurn({
+    agentName: "test", receivedAtIso: "2026-08-06T06:00:01.000Z", receivedAtLocal: "06:00", mergedText: "早",
+  });
+  await coordinator.applyTurn({
+    structuredResult: validResult({ reply: "早呀" }),
+    turnUserText: "早",
+    receivedAtIso: "2026-08-06T06:00:01.000Z",
+    prepared: firstPrepared,
+    sendReply: async () => true,
+  });
+  const afterFirstRollover = stores.episodeStore.load();
+  assert.notEqual(afterFirstRollover.id, originalId);
+  const rolledOverId = afterFirstRollover.id;
+
+  // A second turn arrives seconds later — nowhere near another 6h gap from the
+  // rollover that just happened.
+  const secondPrepared = await coordinator.prepareTurn({
+    agentName: "test", receivedAtIso: "2026-08-06T06:00:05.000Z", receivedAtLocal: "06:00", mergedText: "在吗",
+  });
+  await coordinator.applyTurn({
+    structuredResult: validResult({ reply: "在的" }),
+    turnUserText: "在吗",
+    receivedAtIso: "2026-08-06T06:00:05.000Z",
+    prepared: secondPrepared,
+    sendReply: async () => true,
+  });
+
+  assert.equal(stores.episodeStore.load().id, rolledOverId);
+  const archivedFiles = fs.readdirSync(config.episodeArchiveDir);
+  assert.equal(archivedFiles.length, 1);
+});
+
+// Spec §9 test 13: episode, memory, state, and intentions must all survive a
+// process restart. Simulated here by dropping every in-memory store/
+// coordinator reference and rebuilding fresh ones against the same config —
+// there is no in-process cache to "accidentally" make this pass.
+test("episode, memory, state, and intentions all recover after a simulated restart", async () => {
+  const { config, stores, coordinator } = makeHarness();
+  const prepared = await coordinator.prepareTurn({
+    agentName: "test", receivedAtIso: "2026-08-06T10:00:00.000Z", receivedAtLocal: "10:00", mergedText: "我喜欢猫",
+  });
+  await coordinator.applyTurn({
+    structuredResult: validResult({
+      reply: "记住啦",
+      statePatch: { currentActivity: "聊天" },
+      memory: { remember: [{ category: "preference", fact: "喜欢猫", tier: "core", sourceQuote: "我喜欢猫" }], forget: [] },
+      loops: { add: [{ summary: "查航班", sourceQuote: "我喜欢猫" }], resolve: [] },
+      intentions: { create: [{ type: "resume_topic", reason: "还没聊完的话题", sourceQuote: "我喜欢猫" }], resolve: [] },
+    }),
+    turnUserText: "我喜欢猫",
+    receivedAtIso: "2026-08-06T10:00:00.000Z",
+    prepared,
+    sendReply: async () => true,
+  });
+
+  // Fresh stores against the same config, as a restarted process would create.
+  const freshCurrentStateStore = createCurrentStateStore(config);
+  const freshEpisodeStore = createEpisodeStore(config);
+  const freshMemoryStore = createMemoryStore(config);
+  const freshIntentionsStore = createIntentionsStore(config);
+
+  const state = freshCurrentStateStore.load();
+  assert.equal(state.currentActivity, "聊天");
+  assert.equal(state.openLoops.length, 1);
+
+  const episode = freshEpisodeStore.load();
+  assert.equal(episode.messages.length, 2);
+
+  const memoryState = freshMemoryStore.load();
+  assert.equal(memoryState.memories.length, 1);
+
+  const intentionsState = freshIntentionsStore.load();
+  assert.equal(intentionsState.intentions.length, 1);
+  assert.equal(intentionsState.intentions[0].type, "resume_topic");
 });
