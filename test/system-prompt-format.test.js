@@ -3,27 +3,29 @@ const assert = require("node:assert/strict");
 const fs = require("fs");
 const path = require("path");
 
-// Session 1's runtime adapter only forwards `parsed.result` from `claude -p
-// --output-format json` as plain WeChat text — it never passes a JSON Schema
-// to the model (see src/adapters/runtime/claudecode/index.js buildArgs/parseResult).
-// If the system prompt tells the model to emit schema-constrained JSON anyway,
-// the model improvises a JSON object (e.g. {"message": "..."}) and that raw
-// JSON string gets sent to the user verbatim instead of a normal reply.
+// Session 1 shipped a runtime that only forwarded plain text but a system
+// prompt that asked for JSON — the mismatch made the model improvise raw JSON
+// text straight to WeChat. Session 2 wires real --json-schema structured
+// output (src/adapters/runtime/claudecode/index.js), so the system prompt must
+// now go back to requesting schema-following output — and this file's own
+// assertions invert with it. See docs/session-2-spec.md §3: "不得出现
+// 'prompt 要求 JSON、runtime 却未传 schema' 的旧问题".
 const SYSTEM_PROMPT_PATH = path.resolve(__dirname, "..", "templates", "system-prompt.txt");
+const RUNTIME_ADAPTER_PATH = path.resolve(__dirname, "..", "src", "adapters", "runtime", "claudecode", "index.js");
 
 function readSystemPrompt() {
   return fs.readFileSync(SYSTEM_PROMPT_PATH, "utf8");
 }
 
-test("system prompt does not instruct JSON Schema output while the runtime forwards plain text", () => {
+test("system prompt instructs schema-following, no Markdown/explanation output", () => {
   const prompt = readSystemPrompt();
-  assert.doesNotMatch(prompt, /JSON\s*Schema/i);
-  assert.doesNotMatch(prompt, /严格.{0,10}JSON/);
+  assert.match(prompt, /JSON\s*Schema/i);
+  assert.match(prompt, /严格.{0,10}JSON/);
 });
 
-test("system prompt explicitly instructs plain-text-only replies", () => {
-  const prompt = readSystemPrompt();
-  assert.match(prompt, /纯文本/);
+test("runtime adapter actually passes --json-schema (prompt/runtime can't drift apart again)", () => {
+  const adapterSource = fs.readFileSync(RUNTIME_ADAPTER_PATH, "utf8");
+  assert.match(adapterSource, /--json-schema/);
 });
 
 function looksLikeRawJsonReply(text) {

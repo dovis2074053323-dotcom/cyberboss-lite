@@ -3,11 +3,25 @@ const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
+const { RESULT_JSON_SCHEMA } = require("../../../core/result-schema");
 
 // Single-shot runtime: every turn is a fresh `claude -p` process with no tools, no
 // MCP, no slash commands, no session persistence, and no CLAUDE.md/settings discovery.
 // There is no resumable thread — relationship continuity is Cyberboss's own job
-// (episode/memory, added in a later session), not Claude Code's.
+// (episode/memory/intentions, session 2), not Claude Code's.
+//
+// Structured output (session 2, spec §3): the installed CLI (verified against
+// 2.1.223) takes `--json-schema <json>` and returns the parsed object under
+// `structured_output` in the --output-format json envelope — `result` is only
+// that same object re-serialized to a string. We read `structured_output`
+// directly and never assume the old plain-text-in-`result` shape. There is no
+// `--max-turns` flag on this CLI; "one call per merged turn" is enforced by
+// spawning exactly one `claude` process per flushed batch, not by a CLI flag —
+// the CLI's own `num_turns` in the response reflects its internal structured-
+// output validation round-trip (observed as 2 even for a single logical call)
+// and is not meaningful here.
+const RESULT_SCHEMA_JSON = JSON.stringify(RESULT_JSON_SCHEMA);
+
 function createClaudeCodeRuntimeAdapter(config) {
   const command = config.claudeCommand || "claude";
   const systemPrompt = loadSystemPrompt(config);
@@ -54,6 +68,7 @@ function buildArgs({ text, config, systemPrompt }) {
     "--tools", "",
     "--no-session-persistence",
     "--output-format", "json",
+    "--json-schema", RESULT_SCHEMA_JSON,
   ];
   if (systemPrompt) {
     args.push("--system-prompt", systemPrompt);
@@ -114,8 +129,15 @@ function parseResult(raw) {
   } catch (error) {
     throw new Error(`claude returned non-JSON output: ${String(error.message || error)}`);
   }
+  // `structured_output` is the CLI's already-parsed object for --json-schema
+  // calls; `result` is the same content re-serialized to a string and is only
+  // kept here for diagnostics — the coordinator must not treat it as a reply.
+  const structuredResult = (parsed.structured_output && typeof parsed.structured_output === "object")
+    ? parsed.structured_output
+    : null;
   return {
-    replyText: typeof parsed.result === "string" ? parsed.result : "",
+    structuredResult,
+    rawResultText: typeof parsed.result === "string" ? parsed.result : "",
     isError: Boolean(parsed.is_error),
     stopReason: parsed.stop_reason || "",
     usage: {
@@ -142,4 +164,4 @@ function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-module.exports = { createClaudeCodeRuntimeAdapter };
+module.exports = { createClaudeCodeRuntimeAdapter, buildArgs, parseResult, RESULT_SCHEMA_JSON };
