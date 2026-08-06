@@ -413,26 +413,61 @@ spec §9's 16 required items to what actually covers them:
     from session 1 (only `buildArgs`/`parseResult` were touched this session,
     not the `mkdtempSync`/symlink/`rmSync`-in-`finally` flow); re-verified live
     as part of item 16 below, same as session 1 originally verified it.
-16. Real WeChat structured-reply round-trip — **pending**, see below.
+16. Real WeChat structured-reply round-trip — **done**, see below.
 
-### Real WeChat verification — not yet run
+### Real WeChat verification (done)
 
-Everything above is verified with real `claude` CLI calls (live schema
-smoke-tests during development) and a full local test suite, but **no live
-WeChat round-trip has been run against this session's code yet**. That's the
-one remaining spec §10 step, deliberately last because it needs the deployed
-`/srv/cyberboss-lite/app` copy (owned by the `cyberboss` Linux user) running
-against vv's real WeChat account — a real-world-visible action, held for an
-explicit go-ahead rather than run autonomously. `lite` has not been pushed yet
-either, pending that verification per spec §10's ordering.
+`/home/keke/cyberboss-lite/app` (HEAD `b7ad9e5` at the time) was mirrored to
+`/srv/cyberboss-lite/app` via `rsync -a --delete --exclude=node_modules
+--exclude=.git` (no `package.json` changes this session, so no `npm install`
+needed), owned back to `cyberboss:cyberboss`. `npm run check` and `node --test`
+(107/107) both re-run clean as the `cyberboss` user on the deployed copy before
+starting anything. Listener started via the existing `state/run-start.sh`,
+`setsid`'d and detached (confirmed `PPID=1`, own session) — no systemd, matching
+spec. Existing account/sender-allowlist/context-token from session 1's
+real-device pass were reused as-is; no re-login, no re-bootstrap.
+`CYBERBOSS_ENABLE_SCHEDULED_INTENTIONS` was confirmed unset in `run-start.sh`
+(defaults `false`).
+
+Four rounds tested live against vv's real WeChat account, all passing:
+
+- **A — plain structured reply**: `我好困。` → natural plain-text reply, no raw
+  JSON, exactly one `"mode":"reply"` log line, `rolloverReason:"none"`
+  (structured result validated and applied cleanly, not the
+  `invalid_structured_result` path).
+- **B — memory write**: `记住，我不喜欢把普通聊天变成一堆建议。` → exactly one
+  new record in `memories.json`, `sourceQuote` exactly equal to what was
+  typed — self-verifying, since a non-verbatim quote would have failed
+  `validateStructuredResult` and the memory would never have been persisted at
+  all. `recentMood` (transient) landed in `current-state.json`, not in the
+  memory record — clean separation per spec §5's "不保存短暂情绪".
+- **C — current state / open loop**: `我现在在测试 Cyberboss，测试完还要整理
+  结果！` → `current-state.json.currentActivity` set correctly, no extra
+  fields, valid `schemaVersion`/`updatedAt` envelope (atomic write). The model
+  chose not to open a loop for "整理结果" (judged not to rise to a trackable
+  commitment) — acceptable since the spec's acceptance criterion is state *or*
+  loop, not both.
+- **D — restart recovery**: listener stopped with `SIGTERM` (clean exit,
+  confirmed process gone), restarted fresh (new PID, new Node process), then
+  asked "刚才在做什么？". Reply continued the same conversation in tone and
+  content — confirmed from `episodes/current.json`: **same `episodeId`
+  post-restart**, all 4 turns (8 messages) from before *and* after the restart
+  present in one continuous transcript, loaded purely from disk with no Claude
+  session to resume from (`--no-session-persistence` was already true before
+  session 2). `memories.json` and `current-state.json` both survived intact.
+  No sender-bootstrap re-trigger — `allowedSenderId` loaded from
+  `sender-allowlist.json` at boot, reply sent normally.
+
+Known limitation surfaced by real traffic (not a defect, a scope note): none of
+A–D exercised `soft`/`hard` episode-budget rollover or an actual `reminder`/
+`check_in` intention creation — real conversations don't hit ~3500 estimated
+tokens in 4 short turns, and the test plan deliberately excluded scheduled-
+intention proactive sending (stays off, spec §6). Both paths are covered by
+`test/turn-coordinator.test.js`/`test/intentions-store.test.js`'s synthetic
+tests, just not yet by live traffic — worth a longer live session in session 3
+once Pulse/Tasker add more natural volume.
 
 ## For session 3
-
-Once live-verified: sync `/home/keke/cyberboss-lite/app` → `/srv/cyberboss-lite/app`
-(no `package.json` changes this session, so no `npm install` needed), restart
-the listener, confirm a real structured reply round-trips and that
-`state/episodes/`, `state/memories.json`, `state/intentions.json` persist
-correctly across a restart on the real deployment.
 
 Session 3 scope per `docs/session-2-spec.md`: Pulse, Tasker observation,
 systemd unit, the real Morrow-side `/run/agent-runtime` host flock (the
@@ -440,3 +475,12 @@ systemd unit, the real Morrow-side `/run/agent-runtime` host flock (the
 `executeDueIntentions` already expects are both waiting for this), and only
 then flip `CYBERBOSS_ENABLE_SCHEDULED_INTENTIONS=true` for real reminder/
 check_in proactive sending.
+
+The temporary listener started for this session's live verification was
+stopped cleanly (`SIGTERM`) at the end of the session — same as session 1,
+there is no systemd unit, so nothing is left running as an unmanaged process
+between sessions. Start it the same way session 1 documented: `sudo -u
+cyberboss bash -c 'setsid /srv/cyberboss-lite/state/run-start.sh >
+/srv/cyberboss-lite/state/start.log 2>&1 < /dev/null &'` (redirect must happen
+*inside* the `sudo -u` shell, not before it, or it fails with a permission
+error writing to a `cyberboss`-owned log file as `keke`).
