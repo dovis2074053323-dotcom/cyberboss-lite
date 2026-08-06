@@ -224,14 +224,219 @@ dev clone; no other files were affected, confirmed via full re-diff). Prefer
 `sudo -u <user> <script-file>` or `sudo -u <user> bash -c '<single-line-script>'`
 (no `-i`) instead.
 
-## For the next session
+## Session 2 (episode / memory / Future Intentions / structured output)
 
-Read this file + `git log --oneline -5` on the `lite` branch. Session 1's three
-real-device verification items (login, sender bootstrap, 10s merge) are done —
-move into session 2: episode state machine, token-budget rollover, long-term
-memory, JSON Schema structured output, Future Intentions. When structured output
-lands, restore the schema-following system prompt (see "Important for session 2"
-above) and delete/replace the plain-text assertions in
-`test/system-prompt-format.test.js` accordingly. Still targeting three total `cc`
-sessions per the original spec (this was session 1 + a real-device verification
-pass, not a new session).
+Session 2's actual spec text lives at `docs/session-2-spec.md`, committed verbatim
+(`a64a74d`) after a real gap was found: this status doc's session-1 section cited
+"spec §5/§9/§12" as if a numbered document existed in the repo, but it never did —
+the spec had only ever been discussed in chat. `docs/session-2-spec.md` is now the
+one committed, citable source for everything below; this section records what was
+actually built against it, plus every place the spec left a gap and how it was
+filled.
+
+Commits, in the order spec §10 required (`git log --oneline a64a74d..434099c`):
+
+1. `a64a74d` — session-2 spec saved verbatim.
+2. `bdd0da3` — removed 13 dead test files left over from the session-1 rewrite
+   (Codex adapter, timeline, stickers, tool-host, image handling, old per-thread
+   dispatch) — all either failed `require()` or exercised deleted `CyberbossApp`
+   methods. `node --test` went from 26 pass / 37 fail to 26/26 green, needed as a
+   clean baseline before adding session-2's own tests.
+3. `9d76800` — JSON Schema structured output wired into the runtime adapter.
+4. `05a96d8` — `current-state.json` / open-loops storage + episode state machine.
+5. `e0b3847` — two-tier long-term memory store.
+6. `534cccb` — Future Intentions store.
+7. `cdd5cdc` — context assembly + transactional turn coordinator wired into
+   `app.js`; deleted `reminder-service.js` / `reminder-queue-store.js` (both
+   already broken, depending on the deleted `default-targets.js`).
+8. `434099c` — found and fixed a real validation gap (below), filled the
+   remaining spec §9 required tests.
+
+### JSON Schema & runtime (spec §3)
+
+Verified against the installed CLI (2.1.223) before writing any code:
+`claude --help` lists a real `--json-schema <schema>` flag. A live `-p` call with
+`--json-schema` + `--output-format json` returns the parsed object under
+**`structured_output`** in the response envelope — `result` is the same content
+re-serialized to a string, not a different/older shape. `src/adapters/runtime/claudecode/index.js`
+now reads `structured_output` and no longer exposes any `replyText`-shaped field
+at all, which structurally forecloses the session-1 bug class (schema requested,
+never sent, model improvises raw JSON to WeChat).
+
+**There is no `--max-turns` flag on this CLI version** — the spec's "single call,
+max-turns=1" intent is satisfied by process-spawn discipline (`app.js` spawns
+exactly one `claude` process per merged WeChat batch), not a CLI flag. The
+response's own `num_turns` is consistently `2` even for one logical call — an
+internal detail of how the CLI validates structured output (looks like a
+tool-call round-trip under the hood) — and isn't meaningful here.
+
+`src/core/result-schema.js` defines both the JSON Schema handed to the CLI and a
+**hand-written JS validator**, deliberately not a generic engine like ajv — the
+result shape is small and fixed, and this repo already keeps dependencies
+minimal (session-1 note). The CLI's own schema enforcement is defense in depth
+only; the JS validator is the actual gate before any state mutation, per spec
+§3's "非法结构不应用任何状态变更".
+
+System prompt's last line is restored to the schema-following instruction;
+`test/system-prompt-format.test.js`'s assertions were inverted (and a new
+regression test added tying the prompt's claim directly to the adapter actually
+passing `--json-schema`, so the two can't drift apart again in either direction).
+
+### Storage & data structures (spec §2)
+
+All under `stateDir` (`CYBERBOSS_STATE_DIR`, `/srv/cyberboss-lite/state/` in
+deployment), atomic temp-file + rename writes via `src/core/json-store.js`,
+fail-closed on corruption (`StateCorruptionError`, file left untouched, never
+silently reset). `CyberbossApp.start()` now loads every active store once at
+boot and calls `process.exit(1)` with a FATAL log on corruption instead of
+accepting WeChat traffic against unknown state.
+
+- **`current-state.json`** (`src/core/current-state-store.js`): the 5 spec
+  fields *and* `openLoops` in one file — the spec lists only one storage file
+  for both, and separately restricts what the model's `statePatch` may touch to
+  the 3 subjective fields (`currentActivity`/`expectedReturnAt`/`recentMood`).
+  **Interpretation call**: `lastUserMessageAt`/`lastAgentMessageAt`, although
+  named as schema-legal `statePatch` keys in the spec, are never actually taken
+  from the model's patch — the coordinator always sets them from real observed
+  event timestamps (actual inbound receipt / actual confirmed outbound send).
+  Trusting a model's clock claim over an observed fact would contradict the
+  whole system's "don't treat guesses as fact" framing. Open loops are mutated
+  only via `addLoop`/`resolveLoop`, never through a patch.
+- **`memories.json`** (`src/core/memory-store.js`): core (max 12, always fully
+  injected) / contextual (max 30, top-8 scored) tiers. Dedupe is exact-
+  normalized-fact-match within the same category+tier — no fuzzy/embedding
+  matching, per spec's explicit "不引入向量数据库" and the general "保守型"
+  framing. `forget` marks `superseded`; `purgeSuperseded` physically removes
+  after 30 days and never touches `active` records. Contextual scoring is
+  additive and dependency-free: tag match in current message (+3), tag match in
+  an open loop (+2), crude bigram overlap between fact and current message
+  (+2), used/created within the last 3 days (+1) — sorted, capped at 8 items,
+  budgeted at ~900 estimated tokens combined with core.
+- **`intentions.json`** (`src/core/intentions-store.js`): `reminder` /
+  `check_in` / `resume_topic`. Per-type rules the schema's shape check can't
+  express live here: reminder needs a parseable future `dueAt`; check_in needs
+  a parseable `dueAt` within 48h; resume_topic never schedules (`dueAt` always
+  `null`) and defaults `expiresAt` to +7 days when the model doesn't supply one.
+  **Interpretation call**: reminder defaults `expiresAt` to `dueAt`+24h grace —
+  not specified by the spec, but without it an unfired reminder (nothing sends
+  yet this session) would sit `pending` forever, silently eating into the cap
+  of 10. **Interpretation call**: `cancelOnInbound` defaults to `false` for
+  `reminder` and `true` for `check_in`/`resume_topic` — the spec's "用户重新
+  出现...时自动取消" is a general limit without a per-type carve-out, but a
+  reminder is tied to a real `dueAt` (a concrete task), not to user absence, so
+  the user texting about something else shouldn't cancel a medicine reminder
+  due in 20 minutes; check_in and resume_topic both exist *because* the user
+  was quiet, so once they're not quiet the premise is gone. `check_in` cancels
+  silently on any real inbound message (before that turn's model call, in
+  `prepareTurn`); `resume_topic` instead gets injected once into context and
+  resolved as part of that turn's successful apply, per spec's "一次性" /
+  "用户下次入站时注入" framing.
+  Execution interface (`selectDueForExecution` + `executeDueIntentions`) is
+  implemented and unit-tested with a fake clock and fake lock, but **nothing in
+  `app.js` calls it** — no poller, no cron, no in-process `setInterval`, per
+  spec's explicit scope exclusions. Real sending stays behind
+  `CYBERBOSS_ENABLE_SCHEDULED_INTENTIONS` (default `false`) until session 3
+  wires the host-wide try-lock.
+- **`episodes/current.json` + `episodes/archive/<id>.json`**
+  (`src/core/episode-store.js`): idle rollover (6h, condition A) and budget
+  rollover (soft 3500 / hard 5000 estimated tokens — `ceil(UTF-8 bytes / 3)` —
+  condition B). `rolloverEpisode()` is idempotent against the **on-disk**
+  `rolloverVersion`, not the caller's in-memory copy — checking a caller's own
+  stale copy against itself would never catch a duplicate call, which is
+  exactly the scenario the guard exists for. Hard-limit-without-handoff trims
+  to the last 4 merged turns via `trimToLastTurns`, which counts *user-role*
+  messages rather than assuming clean user/assistant pairing (a silent turn —
+  model chose not to reply — only appends one message).
+  **Interpretation call**: the spec's episode shape has no carry-context field,
+  and rollover carry is explicitly "一次性" (one-shot), so `loadCarryContext`
+  infers "first turn since rollover" from `messages.length === 0` and looks up
+  the most recently archived episode **by file mtime** rather than adding a
+  pointer field — zero schema extension. That historical-archive read is
+  deliberately best-effort (a corrupt/unreadable archive entry just means no
+  carry offered this turn, not a startup failure) — distinct from the
+  fail-closed guarantee, which is reserved for the 4 *active* state files.
+
+A real bug was caught by testing, not inspection: `readJsonStore`'s envelope
+fields (`schemaVersion`/`updatedAt`) were leaking into the in-memory domain
+object every store's `load()` returned. Fixed by stripping them before return
+in every store.
+
+### Transactional coordinator (spec §8)
+
+`src/core/turn-coordinator.js`, split into two phases:
+
+- **`prepareTurn`** commits whatever is true independent of this turn's model
+  output — elapsed real time (idle rollover) and "the user is here now"
+  (check_in reappearance cancellation) — immediately, before the runtime call
+  even happens. It also assembles the bounded context text
+  (`src/core/context-assembler.js`, spec §7's exact field order: MODE/NOW, core
+  memory, contextual memory, current state, open loops, prior-episode carry
+  context, current episode live dialogue, pending resume_topic, this turn's
+  merged messages, rolloverRequested — never full history).
+- **`applyTurn`** does 校验→发送reply→statePatch→loops→memory→intentions→
+  handoff/episode, gated entirely on the structured result validating *and* the
+  reply actually being delivered. **Interpretation call**: on send failure, the
+  *entire* turn's downstream effects void — not just `lastAgentMessageAt` and
+  the episode append that the spec calls out explicitly, but statePatch,
+  memory, loops, and intentions too. The spec's "其他...变更也暂不应用" is a
+  little open-ended about how far "other" reaches; full rollback was chosen as
+  the simplest, most testable reading, and it's the only one consistent with
+  "中途失败不得形成半套状态" (one transaction, not a partial one) — anything
+  narrower would need its own line to draw, and the spec doesn't draw one.
+
+### Test results
+
+`node --test`: **107/107 passing**. `npm run check` (syntax): clean. Mapping
+spec §9's 16 required items to what actually covers them:
+
+1. Schema rejects extra fields/wrong types — `test/result-schema.test.js`
+2. Plain reply never becomes a raw JSON send — `test/claudecode-runtime.test.js`
+   (adapter has no `replyText`-shaped field at all) + `test/system-prompt-format.test.js`
+3. 6h idle rolls over exactly once — `test/turn-coordinator.test.js`
+4. Soft limit produces handoff + rolls over — `test/turn-coordinator.test.js`
+5. Hard limit trims correctly without a handoff — `test/turn-coordinator.test.js`
+6. 50 consecutive turns don't grow context linearly — `test/episode-store.test.js`
+7. Memory without this-turn sourceQuote is rejected — `test/result-schema.test.js`
+8. Duplicate memory doesn't add a new record — `test/memory-store.test.js`
+9. User correction marks a memory superseded — `test/memory-store.test.js`
+10. Intention per-turn-1 / pending-cap-10 — `test/result-schema.test.js` +
+    `test/intentions-store.test.js`
+11. Reminder without an explicit user request is rejected —
+    `test/result-schema.test.js` (the sourceQuote-verbatim gap found and fixed
+    in `434099c`) + `test/intentions-store.test.js` (dueAt validation)
+12. resume_topic injected on next inbound — `test/turn-coordinator.test.js`
+13. Episode/memory/state/intentions all recover after restart —
+    `test/turn-coordinator.test.js`
+14. Scheduled intentions default off — `test/config.test.js` +
+    `test/intentions-store.test.js`
+15. Ephemeral Claude config dir / transcript isolation — unchanged code path
+    from session 1 (only `buildArgs`/`parseResult` were touched this session,
+    not the `mkdtempSync`/symlink/`rmSync`-in-`finally` flow); re-verified live
+    as part of item 16 below, same as session 1 originally verified it.
+16. Real WeChat structured-reply round-trip — **pending**, see below.
+
+### Real WeChat verification — not yet run
+
+Everything above is verified with real `claude` CLI calls (live schema
+smoke-tests during development) and a full local test suite, but **no live
+WeChat round-trip has been run against this session's code yet**. That's the
+one remaining spec §10 step, deliberately last because it needs the deployed
+`/srv/cyberboss-lite/app` copy (owned by the `cyberboss` Linux user) running
+against vv's real WeChat account — a real-world-visible action, held for an
+explicit go-ahead rather than run autonomously. `lite` has not been pushed yet
+either, pending that verification per spec §10's ordering.
+
+## For session 3
+
+Once live-verified: sync `/home/keke/cyberboss-lite/app` → `/srv/cyberboss-lite/app`
+(no `package.json` changes this session, so no `npm install` needed), restart
+the listener, confirm a real structured reply round-trips and that
+`state/episodes/`, `state/memories.json`, `state/intentions.json` persist
+correctly across a restart on the real deployment.
+
+Session 3 scope per `docs/session-2-spec.md`: Pulse, Tasker observation,
+systemd unit, the real Morrow-side `/run/agent-runtime` host flock (the
+`hostLock.tryAcquire()` stub in `app.js` and the non-blocking try-lock contract
+`executeDueIntentions` already expects are both waiting for this), and only
+then flip `CYBERBOSS_ENABLE_SCHEDULED_INTENTIONS=true` for real reminder/
+check_in proactive sending.
