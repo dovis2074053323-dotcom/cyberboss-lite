@@ -467,6 +467,106 @@ intention proactive sending (stays off, spec §6). Both paths are covered by
 tests, just not yet by live traffic — worth a longer live session in session 3
 once Pulse/Tasker add more natural volume.
 
+## Credential ACL: root cause and fix (post-session-2, before session 3)
+
+Found live: real WeChat traffic stopped getting replies after the listener had
+been manually restarted following an idle period. Not a crash, not a WeChat-side
+issue — the runtime adapter's `claude` child process was returning
+`"result":"Not logged in · Please run /login"` (`is_error:true`) on every turn.
+
+**Root cause.** The credential-sharing design (see "System-level setup" above)
+grants `cyberboss` a read-only **file** ACL entry (`u:cyberboss:r`) on keke's
+`~/.claude/.credentials.json`. That grant is only as durable as the inode it's
+attached to. keke's own `claude` CLI usage refreshes its OAuth token by writing
+a **new** file (temp-file + rename — confirmed via `stat`: `Birth` timestamp
+equals `Modify` timestamp, i.e. a fresh inode, not an in-place edit) roughly
+every ~24h per the original observed expiry window. A fresh inode carries none
+of the ACL entries set on the one it replaced, so `cyberboss`'s read grant
+silently disappears on every refresh — with no error at refresh time; the
+failure only surfaces later, as "Not logged in" on the next WeChat turn.
+
+**Why not a directory-level default ACL.** The obvious durable fix — a
+`default:` ACL on `~/.claude` so any new file born there automatically inherits
+`u:cyberboss:r` — was rejected. A directory default ACL applies to *every* file
+and subdirectory subsequently created under `~/.claude`, not just
+`.credentials.json`; that widens `cyberboss`'s reach to whatever else keke's
+own Claude Code usage happens to create there (`settings.local.json`, todos,
+shell snapshots, project state, future files not yet invented). "No broader
+than the one file we actually need" was the explicit constraint, and a default
+ACL structurally cannot honor it — the access surface would grow every time
+keke's own tooling adds a new file to that directory, with no one deciding
+that expansion happened.
+
+**Fix actually shipped: minimal sudo + one fixed script, not a broader grant.**
+
+- `deploy/cyberboss-ensure-claude-credential-acl` (installed to
+  `/usr/local/sbin/…`, `root:root`, `0755` — not writable by `keke` or
+  `cyberboss`): takes zero arguments, hardcodes the one target path, refuses
+  symlinks, confirms the target is a regular file, and does exactly one thing:
+  `setfacl -m u:cyberboss:r-- -- /home/keke/.claude/.credentials.json`. Never
+  reads or prints the file's contents.
+- `deploy/cyberboss-credential-acl.sudoers` (installed to
+  `/etc/sudoers.d/cyberboss-claude-acl`, `root:root`, `0440`, validated with
+  `visudo -cf` both before and after install): grants `cyberboss` — and only
+  `cyberboss` — password-less `sudo` to run that one script as `keke`. Note
+  sudoers' own argument-matching only restricts *which command* may run, not
+  argument count for a bare (no-args-listed) entry — a sudoers rule alone does
+  **not** stop `cyberboss` from invoking the script with extra arguments. The
+  script's own `if [ "$#" -ne 0 ]` check is what actually enforces
+  zero-argument-only; this was verified directly (`sudo -u cyberboss sudo -u
+  keke .../cyberboss-ensure-claude-credential-acl extra-arg` reaches the
+  script and is rejected by it with exit 2, not blocked by sudo itself).
+- `src/adapters/runtime/claudecode/index.js`: `sendSingleTurn` now runs this
+  preflight (`sudo -n -u keke /usr/local/sbin/cyberboss-ensure-claude-credential-acl`)
+  before every `claude` invocation. **Fail closed**: if the preflight itself
+  fails, `claude` is never started for that turn. If `claude` still comes back
+  with an explicit "not logged in"/"please run /login" signal (checked against
+  both the process's stdout when it exits non-zero, and a successfully-parsed
+  `is_error:true` result — the CLI has been observed to exit `1` while still
+  emitting a valid JSON envelope on stdout, so both paths must be checked), the
+  preflight is re-run and the turn is retried **exactly once** — no unbounded
+  retry loop. Logging (`console.log`/`console.error`, existing `[cyberboss]`
+  prefix convention) records only preflight success/failure and the retry
+  decision, never file contents, tokens, or the credential path's contents.
+  Install/reproduce steps: `docs/credential-acl-install.md`.
+- Bundled in the same fix: `runClaudeProcess` now spawns `claude` with
+  `stdio: ["ignore", "pipe", "pipe"]` instead of the implicit `"pipe"` default
+  for stdin. Nothing was ever writing to the child's stdin, so every single
+  turn was stalling ~3s on the CLI's own "no stdin data received" timeout
+  before proceeding — unrelated to the ACL bug, but found while reproducing it
+  and trivial to fix in the same function.
+
+**Verified.** `npm run check` and `node --test` (107/107) both clean on the dev
+tree and, after `rsync`, on the `cyberboss`-owned `/srv/cyberboss-lite/app`
+deployed copy. Sudo chain confirmed end-to-end as `cyberboss`:
+`u:cyberboss:r--` present on the credential file after running the preflight
+through `sudo`; `cyberboss` still cannot `ls` or read anything else under
+`~/.claude` (no default ACL exists anywhere on the path — confirmed via
+`getfacl` on both `~/.claude` and `~`, only the pre-existing `--x`
+traverse-only entries remain). One real round-trip against vv's live WeChat
+account through the rebuilt listener came back `isError:false` with the
+`[cyberboss] acl preflight ok` log line preceding it. Listener stopped
+(`SIGTERM`, graceful exit confirmed) after verification — no systemd unit
+exists yet, same as every prior session.
+
+**Known limitation, unchanged by this fix:** the shared-credential design still
+structurally depends on keke's own regular `claude` CLI usage to keep the
+underlying OAuth token refreshed — `cyberboss` has read-only access and cannot
+refresh it itself. This fix only makes sure `cyberboss` keeps *read access to
+whatever the current token is*; if keke's own usage pattern ever stops for long
+enough that the refresh token itself expires (~6 days observed at the original
+setup), no ACL fix restores a token that no longer exists. Not addressed here,
+same as the original "System-level setup" note.
+
+**Deliberately not added: an ACL heartbeat.** No poller, no timer, no
+proactive re-grant when nothing is happening. The existing per-turn preflight
+in `sendSingleTurn` already covers every path that calls `claude` — normal
+replies today, and Pulse / scheduled intentions once session 3 wires them in,
+since all three go through the same runtime adapter. Session 3 adds exactly
+one more preflight call, at systemd unit start (before the bridge loop begins
+accepting messages) — still not a recurring heartbeat, just one more
+call site of the same synchronous check.
+
 ## For session 3
 
 Session 3 scope per `docs/session-2-spec.md`: Pulse, Tasker observation,
@@ -474,7 +574,10 @@ systemd unit, the real Morrow-side `/run/agent-runtime` host flock (the
 `hostLock.tryAcquire()` stub in `app.js` and the non-blocking try-lock contract
 `executeDueIntentions` already expects are both waiting for this), and only
 then flip `CYBERBOSS_ENABLE_SCHEDULED_INTENTIONS=true` for real reminder/
-check_in proactive sending.
+check_in proactive sending. Also add one ACL preflight call at systemd unit
+start (see "Credential ACL" section above) — not a new mechanism, just one
+more call site of the existing `sendSingleTurn` preflight, run once before the
+bridge loop starts accepting messages.
 
 The temporary listener started for this session's live verification was
 stopped cleanly (`SIGTERM`) at the end of the session — same as session 1,

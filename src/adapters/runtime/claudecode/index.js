@@ -22,6 +22,18 @@ const { RESULT_JSON_SCHEMA } = require("../../../core/result-schema");
 // and is not meaningful here.
 const RESULT_SCHEMA_JSON = JSON.stringify(RESULT_JSON_SCHEMA);
 
+// keke's own `claude` CLI usage rewrites (not edits) ~/.claude/.credentials.json
+// on every OAuth refresh — a fresh inode that drops whatever ACL grant let
+// cyberboss read the previous one. This fixed, argument-less, root-owned
+// script re-applies exactly that one grant on exactly that one path; see
+// /usr/local/sbin/cyberboss-ensure-claude-credential-acl and
+// /etc/sudoers.d/cyberboss-claude-acl (only this exact invocation, no
+// password, cyberboss -> keke). Run before every turn; fail closed if it
+// doesn't succeed — never fall back to running claude without a fresh grant.
+const ACL_PREFLIGHT_COMMAND = "/usr/bin/sudo";
+const ACL_PREFLIGHT_ARGS = ["-n", "-u", "keke", "/usr/local/sbin/cyberboss-ensure-claude-credential-acl"];
+const NOT_LOGGED_IN_PATTERN = /not logged in|please run \/login/i;
+
 function createClaudeCodeRuntimeAdapter(config) {
   const command = config.claudeCommand || "claude";
   const systemPrompt = loadSystemPrompt(config);
@@ -40,25 +52,84 @@ function createClaudeCodeRuntimeAdapter(config) {
       if (!normalizeText(config.sharedCredentialsFile)) {
         throw new Error("CYBERBOSS_SHARED_CREDENTIALS_FILE is not configured");
       }
-      fs.mkdirSync(config.claudeConfigDirRoot, { recursive: true });
-      const configDir = fs.mkdtempSync(path.join(config.claudeConfigDirRoot, "cfg-"));
+
+      await runAclPreflightOrThrow();
+
       try {
-        fs.symlinkSync(config.sharedCredentialsFile, path.join(configDir, ".credentials.json"));
-        const args = buildArgs({ text, config, systemPrompt });
-        const env = buildEnv({ configDir });
-        const raw = await runClaudeProcess({
-          command,
-          args,
-          env,
-          cwd: config.workspaceRoot,
-          timeoutMs: config.claudeTurnTimeoutMs,
-        });
-        return parseResult(raw);
-      } finally {
-        fs.rmSync(configDir, { recursive: true, force: true });
+        return await attemptTurn({ text, config, systemPrompt, command });
+      } catch (error) {
+        if (!error.notLoggedIn) {
+          throw error;
+        }
+        // Exactly one retry: the preflight above already ran this turn, so a
+        // not-logged-in result means the grant it just applied still isn't
+        // enough (e.g. a second refresh raced it) — try once more, then give
+        // up rather than loop.
+        console.error("[cyberboss] claude reported not-logged-in; retrying acl preflight once");
+        await runAclPreflightOrThrow();
+        return await attemptTurn({ text, config, systemPrompt, command });
       }
     },
   };
+}
+
+async function runAclPreflightOrThrow() {
+  try {
+    await runAclPreflight();
+    console.log("[cyberboss] acl preflight ok");
+  } catch (error) {
+    console.error(`[cyberboss] acl preflight failed: ${error.message}`);
+    throw new Error("acl preflight failed; refusing to start claude (fail closed)");
+  }
+}
+
+function runAclPreflight() {
+  return new Promise((resolve, reject) => {
+    const child = spawn(ACL_PREFLIGHT_COMMAND, ACL_PREFLIGHT_ARGS, { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(`preflight script exited with code ${code}: ${stderr.slice(0, 300)}`));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+async function attemptTurn({ text, config, systemPrompt, command }) {
+  fs.mkdirSync(config.claudeConfigDirRoot, { recursive: true });
+  const configDir = fs.mkdtempSync(path.join(config.claudeConfigDirRoot, "cfg-"));
+  try {
+    fs.symlinkSync(config.sharedCredentialsFile, path.join(configDir, ".credentials.json"));
+    const args = buildArgs({ text, config, systemPrompt });
+    const env = buildEnv({ configDir });
+    const raw = await runClaudeProcess({
+      command,
+      args,
+      env,
+      cwd: config.workspaceRoot,
+      timeoutMs: config.claudeTurnTimeoutMs,
+    }).catch((error) => {
+      if (typeof error.stdout === "string" && NOT_LOGGED_IN_PATTERN.test(error.stdout)) {
+        const wrapped = new Error("claude reported not-logged-in");
+        wrapped.notLoggedIn = true;
+        throw wrapped;
+      }
+      throw error;
+    });
+    const parsed = parseResult(raw);
+    if (parsed.isError && NOT_LOGGED_IN_PATTERN.test(parsed.rawResultText)) {
+      const wrapped = new Error("claude reported not-logged-in");
+      wrapped.notLoggedIn = true;
+      throw wrapped;
+    }
+    return parsed;
+  } finally {
+    fs.rmSync(configDir, { recursive: true, force: true });
+  }
 }
 
 function buildArgs({ text, config, systemPrompt }) {
@@ -100,6 +171,10 @@ function runClaudeProcess({ command, args, env, cwd, timeoutMs }) {
       env,
       timeout: timeoutMs,
       killSignal: "SIGKILL",
+      // Explicit stdin: 'ignore' (closed immediately) instead of the 'pipe'
+      // default — nothing ever writes to it, and left open the CLI stalls
+      // every single turn for 3s waiting for stdin data before proceeding.
+      stdio: ["ignore", "pipe", "pipe"],
     });
 
     let stdout = "";
@@ -114,7 +189,9 @@ function runClaudeProcess({ command, args, env, cwd, timeoutMs }) {
         return;
       }
       if (code !== 0) {
-        reject(new Error(`claude exited with code ${code}: ${stderr.slice(0, 500)}`));
+        const error = new Error(`claude exited with code ${code}: ${stderr.slice(0, 500)}`);
+        error.stdout = stdout;
+        reject(error);
         return;
       }
       resolve(stdout);
