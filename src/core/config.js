@@ -38,7 +38,27 @@ function readConfig() {
     // Shared OAuth credential file this account only has read+traverse ACL on (see cc-connect-style symlink).
     // Must be set explicitly in production; no cross-user default is guessed here.
     sharedCredentialsFile: readTextEnv("CYBERBOSS_SHARED_CREDENTIALS_FILE"),
+
+    // Session 2 (docs/session-2-spec.md §2): current state / open loops / long-term
+    // memory / Future Intentions / episode storage, all atomic-write JSON under stateDir.
+    currentStateFile: path.join(stateDir, "current-state.json"),
+    memoriesFile: path.join(stateDir, "memories.json"),
+    intentionsFile: path.join(stateDir, "intentions.json"),
+    episodesDir: path.join(stateDir, "episodes"),
+    episodeCurrentFile: path.join(stateDir, "episodes", "current.json"),
+    episodeArchiveDir: path.join(stateDir, "episodes", "archive"),
+    // spec §6: real proactive reminder/check_in sending stays off until session 3
+    // wires the host-wide try-lock; resume_topic (no proactive send) can be live.
+    enableScheduledIntentions: readBoolEnv("CYBERBOSS_ENABLE_SCHEDULED_INTENTIONS", false),
   };
+}
+
+function readBoolEnv(name, defaultValue) {
+  const value = readTextEnv(name);
+  if (!value) {
+    return defaultValue;
+  }
+  return value === "1" || value.toLowerCase() === "true";
 }
 
 function readTextEnv(name) {
