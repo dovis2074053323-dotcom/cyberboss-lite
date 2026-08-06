@@ -1,10 +1,17 @@
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const { createWeixinChannelAdapter } = require("../adapters/channel/weixin");
 const { createClaudeCodeRuntimeAdapter } = require("../adapters/runtime/claudecode");
 const { createSenderGate } = require("./sender-gate");
 const { TurnGateStore } = require("./turn-gate-store");
-const { buildInboundDraft, mergeBufferedInboundTexts, assembleRuntimeTurnText } = require("./inbound-turn");
+const { buildInboundDraft, mergeBufferedInboundTexts, formatWechatLocalTime } = require("./inbound-turn");
+const { createCurrentStateStore } = require("./current-state-store");
+const { createEpisodeStore } = require("./episode-store");
+const { createMemoryStore } = require("./memory-store");
+const { createIntentionsStore } = require("./intentions-store");
+const { createTurnCoordinator } = require("./turn-coordinator");
+const { StateCorruptionError } = require("./json-store");
 
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
 const RETRY_DELAY_MS = 2_000;
@@ -33,6 +40,16 @@ class CyberbossApp {
     this.runtimeAdapter = createClaudeCodeRuntimeAdapter(config);
     this.senderGate = createSenderGate(config);
     this.turnGateStore = new TurnGateStore();
+    this.currentStateStore = createCurrentStateStore(config);
+    this.episodeStore = createEpisodeStore(config);
+    this.memoryStore = createMemoryStore(config);
+    this.intentionsStore = createIntentionsStore(config);
+    this.turnCoordinator = createTurnCoordinator({
+      currentStateStore: this.currentStateStore,
+      episodeStore: this.episodeStore,
+      memoryStore: this.memoryStore,
+      intentionsStore: this.intentionsStore,
+    });
     this.pendingMessages = [];
     this.mergeTimer = null;
   }
@@ -60,6 +77,12 @@ class CyberbossApp {
     // cleanup, so sweep any orphaned per-turn CLAUDE_CONFIG_DIRs (and their
     // credential symlinks) left behind before accepting new messages.
     sweepStaleClaudeConfigDirs(this.config.claudeConfigDirRoot);
+
+    // Spec §2 fail-closed guarantee: load every active state file once at boot.
+    // A corrupt file must stop the process before it accepts any WeChat
+    // traffic — proceeding on a guessed/reset default would silently diverge
+    // from whatever the user last saw.
+    this.loadAllStoresOrExit();
 
     const account = this.channelAdapter.resolveAccount();
     await this.channelAdapter.loadSyncBuffer();
@@ -102,6 +125,22 @@ class CyberbossApp {
     } finally {
       shutdown.dispose();
       this.clearMergeTimer();
+    }
+  }
+
+  loadAllStoresOrExit() {
+    try {
+      this.currentStateStore.load();
+      this.episodeStore.ensureCurrent(new Date().toISOString());
+      this.memoryStore.load();
+      this.intentionsStore.load();
+    } catch (error) {
+      if (error instanceof StateCorruptionError) {
+        console.error(`[cyberboss] FATAL: ${error.message}`);
+        console.error("[cyberboss] refusing to start with corrupt state — fix or restore the file by hand, nothing is auto-reset.");
+        process.exit(1);
+      }
+      throw error;
     }
   }
 
@@ -176,40 +215,67 @@ class CyberbossApp {
     this.pendingMessages = [];
     const latest = batch[batch.length - 1];
     const mergedText = mergeBufferedInboundTexts(batch);
+    const receivedAtIso = latest.receivedAt;
+    const sourceTurnId = latest.messageId || `turn_${crypto.randomUUID()}`;
 
     this.turnGateStore.begin(SCOPE_BINDING_KEY, this.config.workspaceRoot);
     const lock = await hostLock.tryAcquire();
+    let logPayload = { mode: "reply", episodeId: "", rolloverReason: "none", isError: false };
     try {
-      const turnText = assembleRuntimeTurnText({ text: mergedText, receivedAt: latest.receivedAt });
+      const prepared = await this.turnCoordinator.prepareTurn({
+        agentName: this.config.agentName,
+        receivedAtIso,
+        receivedAtLocal: formatWechatLocalTime(receivedAtIso),
+        mergedText,
+      });
+
       const startedAt = Date.now();
-      const result = await this.runtimeAdapter.sendSingleTurn({ text: turnText });
-      console.log(JSON.stringify({
+      const result = await this.runtimeAdapter.sendSingleTurn({ text: prepared.turnText });
+      const durationMs = Date.now() - startedAt;
+
+      const applyResult = await this.turnCoordinator.applyTurn({
+        structuredResult: result.structuredResult || {},
+        turnUserText: mergedText,
+        receivedAtIso,
+        sourceTurnId,
+        prepared,
+        sendReply: async (replyText) => {
+          return this.channelAdapter.sendText({
+            userId: latest.senderId,
+            text: replyText,
+            contextToken: latest.contextToken,
+          }).then(() => true).catch((error) => {
+            console.error(`[cyberboss] send failed: ${formatErrorMessage(error)}`);
+            return false;
+          });
+        },
+      });
+
+      logPayload = {
         mode: "reply",
         inputTokens: result.usage.inputTokens,
         outputTokens: result.usage.outputTokens,
         cacheReadTokens: result.usage.cacheReadTokens,
         cacheCreationTokens: result.usage.cacheCreationTokens,
-        durationMs: Date.now() - startedAt,
-        lockResult: "acquired",
-        isError: result.isError,
-      }));
+        durationMs,
+        episodeId: applyResult.episodeId || prepared.episode.id,
+        rolloverReason: applyResult.applied ? applyResult.rolloverAction : (applyResult.reason || "unknown"),
+        isError: Boolean(result.isError) || !applyResult.applied,
+      };
 
-      await this.channelAdapter.sendTyping({ userId: latest.senderId, status: 0 }).catch(() => {});
-      if (result.replyText) {
-        const sendOk = await this.channelAdapter.sendText({
-          userId: latest.senderId,
-          text: result.replyText,
-          contextToken: latest.contextToken,
-        }).then(() => true).catch((error) => {
-          console.error(`[cyberboss] send failed: ${formatErrorMessage(error)}`);
-          return false;
-        });
-        console.log(JSON.stringify({ mode: "reply", sendResult: sendOk ? "ok" : "failed" }));
+      if (!applyResult.applied) {
+        console.warn(`[cyberboss] turn not applied: ${applyResult.reason}${applyResult.errors ? ` ${JSON.stringify(applyResult.errors)}` : ""}`);
       }
+      // Stop typing regardless of outcome (sent, silent, invalid, or rejected) —
+      // the user should never be left seeing "typing..." forever.
+      await this.channelAdapter.sendTyping({ userId: latest.senderId, status: 0 }).catch(() => {});
     } catch (error) {
       console.error(`[cyberboss] turn failed: ${formatErrorMessage(error)}`);
+      logPayload.isError = true;
       await this.channelAdapter.sendTyping({ userId: latest.senderId, status: 0 }).catch(() => {});
     } finally {
+      // Spec §7: never log message bodies, only metadata.
+      console.log(JSON.stringify(logPayload));
       lock.release();
       this.turnGateStore.releaseScope(SCOPE_BINDING_KEY, this.config.workspaceRoot);
     }

@@ -50,4 +50,5 @@ module.exports = {
   buildInboundDraft,
   mergeBufferedInboundTexts,
   assembleRuntimeTurnText,
+  formatWechatLocalTime,
 };
