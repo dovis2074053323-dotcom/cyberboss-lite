@@ -12,17 +12,18 @@ for what's done vs. pending.
 - `origin` = `https://github.com/dovis2074053323-dotcom/cyberboss-lite.git` (vv's fork, public).
 - Working branch: `lite`.
 - Baseline commit (fork point from upstream): `373ab17d283f1e3b304a6a36e17e9e8d44f1acfc`.
-- HEAD as of this session: see `git log -1` — three commits on top of baseline:
+- Commits on top of baseline (see `git log --oneline` for the full, current list):
   1. `38fd226` — WIP: strip out-of-scope modules (deletions + dependency cleanup).
   2. `fa58dd9` — Rewrite composition root for the single-shot Lite runtime.
   3. `bc1b211` — Harden `.gitignore` against accidental credential/state commits.
-- **Push to `origin/lite` is not yet done.** The original `.git-credentials` token
-  couldn't create or push to the fork (403, insufficient scope). vv is creating a
-  fine-grained PAT scoped to just this repo (Contents: Read/write) and will run the
-  push manually from a terminal — the token is intentionally never passed through
-  this chat/tool transcript. Until that push happens, `origin/lite` on GitHub may
-  still be behind or absent; **the local `lite` branch in both paths above is the
-  source of truth**, not GitHub, until confirmed otherwise.
+  4. `b3b2d02` — Add session-1 status doc for handoff to the next cc session.
+  5. Real-device verification session fix — plain-text system prompt + regression
+     test (see "Real-device verification" section below for the SHA once committed).
+- **Push to `origin/lite` landed.** vv's fine-grained PAT push succeeded at some
+  point between the session-1 handoff and the real-device verification session
+  (confirmed via `git ls-remote origin lite` matching local HEAD). `origin/lite` is
+  the current source of truth alongside the local `lite` branch in both paths above;
+  push after every commit and confirm local/origin SHAs match before ending a session.
 
 ## System-level setup (already done, verified)
 
@@ -159,30 +160,78 @@ IPC/lock scratch dir) — not cleaned up automatically. Fine to ignore or add a
   approach): no login prompt, clean process environment (no Morrow/SSH/DB vars
   leaked in via `sudo -iu`).
 
-## Not yet done / next session's job
+## Real-device verification (post-session-1, before session 2)
 
-This was the deliberate stopping point for session 1 — the pieces below are
-implemented in code but **not exercised against real WeChat traffic**, because no
-WeChat account is bound on this box yet:
+All four items session 1 left unexercised were run against real WeChat traffic
+and verified directly from process logs / state files (not inferred from vv's
+reports alone — each claim below was cross-checked by reading
+`/srv/cyberboss-lite/state/` after the fact):
 
-1. `cyberboss login` (QR scan, binds a real WeChat account) — never run.
-2. Sender-gate bootstrap flow (`src/core/sender-gate.js`) — unit-level logic only,
-   not seen a real first message yet.
-3. 10s bubble-merge + turn-gate behavior (`CyberbossApp.bufferInboundMessage` /
-   `flushPendingBatch`) — not exercised against real rapid-fire WeChat messages.
-4. Push `lite` to `origin` (blocked on vv's fine-grained PAT, see above).
+1. **`cyberboss login`** — real QR scan with vv's daily WeChat account, confirmed
+   by iLink (`confirmed` status), account persisted to
+   `state/accounts/<accountId>.json`. Verified `accountId` (the bot's own
+   `ilink_bot_id`) and `userId` (vv's `ilink_user_id`, the scanning account) are
+   two distinct values — scanning authorizes vv as the allowed sender, it does
+   **not** turn vv's personal WeChat into the bot identity.
+2. **Sender-gate bootstrap** — first real inbound message captured `senderId` and
+   persisted it to `state/sender-allowlist.json`; confirmed exactly one non-empty
+   ID, no wildcard, no reply sent for that bootstrap message (per spec 五).
+3. **allowlist + context_token persistence** — both survive a full process
+   restart (confirmed: relaunching `start` after the system-prompt fix below
+   loaded the persisted `allowedSenderId` directly, no re-bootstrap).
+4. **10s bubble-merge** — four messages sent within the merge window produced
+   exactly one `{"mode":"reply", ...}` runtime call in the log, not four.
+5. **Passive receive/send** — real Claude turn round-tripped end to end
+   (`isError:false`, `sendResult:"ok"`), confirmed in `state/start.log`.
+6. `lite` pushed to `origin` (was already landed by the time this session
+   re-checked; see "Repo / remotes" above).
 
-Explicitly out of scope for session 1 and not started: Pulse, episode/context
-rollover, long-term memory, Future Intentions — session 2/3 per the original spec.
-Also not started: the Morrow-side host-wide flock (separate task in the Morrow
-repo, not counted against these three sessions) — Cyberboss's `hostLock` stub is
-ready to be swapped for the real consumer once that lands.
+**Bug found and fixed during verification:** `templates/system-prompt.txt` (copied
+verbatim from the full spec in the `fa58dd9` rewrite) ended with an instruction to
+"strictly follow the provided JSON Schema" — but session 1's runtime adapter
+(`src/adapters/runtime/claudecode/index.js`) never passes a schema; it only
+forwards `parsed.result` from `claude -p --output-format json` as plain WeChat
+text. With no schema actually supplied, Claude improvised a JSON object
+(`{"message": "..."}`) and that raw JSON string got sent to vv verbatim instead of
+a normal reply. Fixed by changing the last line to instruct plain-text-only
+output (no JSON/Markdown). Added `test/system-prompt-format.test.js`
+(`node --test`) asserting the prompt doesn't request JSON/schema output and does
+request plain text, plus a `looksLikeRawJsonReply` guard-test — this is a static
+regression test against the prompt file, not a live-model test. Re-verified with
+a real WeChat message after redeploying + restarting the listener: normal
+plain-text reply confirmed.
+
+**Important for session 2:** when real JSON Schema structured output is wired into
+the runtime adapter (episode/memory/Future Intentions), the system prompt's
+plain-text instruction must be restored to a schema-following instruction *at the
+same time*. Don't change only the runtime and forget the prompt (or vice versa) —
+that mismatch is exactly what caused the bug above.
+
+Listener was stopped cleanly (`SIGTERM`, graceful exit) at the end of this
+session — there is no `systemd` unit and no host-wide flock yet, so nothing should
+be left running as an unmanaged PPID=1 process between sessions. To run it again:
+`sudo -u cyberboss setsid /srv/cyberboss-lite/state/run-start.sh > /srv/cyberboss-lite/state/start.log 2>&1 < /dev/null &` (disown it), or the equivalent `run-login.sh` for
+re-login. Both helper scripts live in `/srv/cyberboss-lite/state/` (not in git —
+they're deployment-side launch scripts, not app code) and already export
+`CYBERBOSS_STATE_DIR` / `CYBERBOSS_SHARED_CREDENTIALS_FILE`.
+
+**Operational note from this session:** avoid `sudo -iu <user> bash -c '...'` with
+a multi-line script and trailing positional args — `sudo -i` reconstructs the
+command by rejoining argv into a new string for the target's login shell, which
+loses the original quoting. That hazard, not any external process, deleted
+`/srv/cyberboss-lite/app/bin/cyberboss.js` mid-session (silently restored from the
+dev clone; no other files were affected, confirmed via full re-diff). Prefer
+`sudo -u <user> <script-file>` or `sudo -u <user> bash -c '<single-line-script>'`
+(no `-i`) instead.
 
 ## For the next session
 
-Read this file + `git log --oneline -5` on the `lite` branch. Pick up at: confirm
-the push to `origin` landed, then run `cyberboss login`, verify sender bootstrap
-against a real first message, verify 10s merge against real rapid WeChat bubbles,
-then move into session 2 (episode state machine, token-budget rollover, long-term
-memory, JSON Schema structured output, Future Intentions). Still targeting three
-total `cc` sessions per the original spec.
+Read this file + `git log --oneline -5` on the `lite` branch. Session 1's three
+real-device verification items (login, sender bootstrap, 10s merge) are done —
+move into session 2: episode state machine, token-budget rollover, long-term
+memory, JSON Schema structured output, Future Intentions. When structured output
+lands, restore the schema-following system prompt (see "Important for session 2"
+above) and delete/replace the plain-text assertions in
+`test/system-prompt-format.test.js` accordingly. Still targeting three total `cc`
+sessions per the original spec (this was session 1 + a real-device verification
+pass, not a new session).
