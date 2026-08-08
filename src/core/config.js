@@ -89,6 +89,15 @@ function readConfig() {
     companionSupabaseUrl: readTextEnv("CYBERBOSS_COMPANION_SUPABASE_URL"),
     companionSupabaseAnonKey: readTextEnv("CYBERBOSS_COMPANION_SUPABASE_ANON_KEY"),
 
+    // Task #12's real on-demand snapshot round trip (request via keke_state's
+    // Realtime channel, poll companion_events for the device's answer) — see
+    // companion-observation.js's getContextSnapshot / pet-state.js's
+    // requestContextSnapshot. Bounded so a screen-off/backgrounded/unreachable
+    // device degrades to a timeout error (caught upstream, round 2 still runs
+    // with an "(unavailable)" marker) instead of hanging the drain tick.
+    contextSnapshotTimeoutMs: readIntEnv("CYBERBOSS_CONTEXT_SNAPSHOT_TIMEOUT_MS") || 15_000,
+    contextSnapshotPollIntervalMs: readIntEnv("CYBERBOSS_CONTEXT_SNAPSHOT_POLL_INTERVAL_MS") || 1_500,
+
     // Stochastic Pulse (upstream WenXiaoWendy/cyberboss's
     // system-checkin-poller.js, ported this session): random-interval wake-up
     // that only enqueues an observation bundle, never decides content itself —

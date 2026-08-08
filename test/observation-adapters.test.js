@@ -112,27 +112,50 @@ test("companion-observation.getRecentSegments returns rows with native jsonb (no
   }
 });
 
-test("companion-observation.getLatestScreenContext reads raw companion_events, not companion_segments", async () => {
+test("companion-observation.getContextSnapshot polls companion_events for the matching requestId and returns as soon as it appears", async () => {
+  let calls = 0;
   const stub = stubFetch((url) => {
+    calls += 1;
     assert.match(url, /companion_events/);
-    assert.match(url, /event=eq\.screen_context/);
-    assert.match(url, /order=created_at\.desc/);
-    assert.match(url, /limit=5/);
-    return jsonResponse([
-      { detail: { package: "com.tencent.mm", activity: "ChattingUI" }, created_at: "2026-08-09T12:00:00Z" },
-    ]);
+    assert.match(url, /event=eq\.context_snapshot/);
+    assert.match(url, /detail->>requestId=eq\.req-1/);
+    if (calls < 3) {
+      return jsonResponse([]); // 设备还没答复
+    }
+    return jsonResponse([{ detail: { requestId: "req-1", package: "com.android.chrome" }, created_at: "2026-08-09T12:00:00Z" }]);
   });
   try {
     const client = createCompanionObservationClient({
       companionSupabaseUrl: "https://companion.supabase.co",
       companionSupabaseAnonKey: "k",
     });
-    const rows = await client.getLatestScreenContext();
-    assert.equal(rows.length, 1);
-    assert.deepEqual(rows[0].detail, { package: "com.tencent.mm", activity: "ChattingUI" });
+    const row = await client.getContextSnapshot({ requestId: "req-1", timeoutMs: 5000, pollIntervalMs: 1 });
+    assert.equal(calls, 3);
+    assert.deepEqual(row.detail, { requestId: "req-1", package: "com.android.chrome" });
   } finally {
     stub.restore();
   }
+});
+
+test("companion-observation.getContextSnapshot times out (throws) if the device never answers", async () => {
+  const stub = stubFetch(() => jsonResponse([]));
+  try {
+    const client = createCompanionObservationClient({
+      companionSupabaseUrl: "https://companion.supabase.co",
+      companionSupabaseAnonKey: "k",
+    });
+    await assert.rejects(
+      () => client.getContextSnapshot({ requestId: "req-1", timeoutMs: 20, pollIntervalMs: 5 }),
+      /timed out waiting for context_snapshot response to req-1/,
+    );
+  } finally {
+    stub.restore();
+  }
+});
+
+test("companion-observation.getContextSnapshot requires a requestId", async () => {
+  const client = createCompanionObservationClient({ companionSupabaseUrl: "https://x.supabase.co", companionSupabaseAnonKey: "k" });
+  await assert.rejects(() => client.getContextSnapshot({}), /requires a requestId/);
 });
 
 test("pet-state.pushExpression PATCHes only the real keke_state columns provided", async () => {
@@ -156,4 +179,27 @@ test("pet-state.pushExpression PATCHes only the real keke_state columns provided
 test("pet-state.pushExpression rejects an empty payload instead of sending a no-op PATCH", async () => {
   const client = createPetStateClient({ companionSupabaseUrl: "https://x.supabase.co", companionSupabaseAnonKey: "k" });
   await assert.rejects(() => client.pushExpression({}), /requires at least one field/);
+});
+
+test("pet-state.requestContextSnapshot PATCHes the magic expression marker + requestId as bubble_text", async () => {
+  const stub = stubFetch((url, init) => {
+    assert.match(url, /keke_state\?id=eq\.1$/);
+    const body = JSON.parse(init.body);
+    assert.deepEqual(body, { expression: "__context_request__", bubble_text: "req-42" });
+    return jsonResponse(null, 204);
+  });
+  try {
+    const client = createPetStateClient({
+      companionSupabaseUrl: "https://companion.supabase.co",
+      companionSupabaseAnonKey: "k",
+    });
+    await client.requestContextSnapshot({ requestId: "req-42" });
+  } finally {
+    stub.restore();
+  }
+});
+
+test("pet-state.requestContextSnapshot requires a requestId", async () => {
+  const client = createPetStateClient({ companionSupabaseUrl: "https://x.supabase.co", companionSupabaseAnonKey: "k" });
+  await assert.rejects(() => client.requestContextSnapshot({}), /requires a requestId/);
 });

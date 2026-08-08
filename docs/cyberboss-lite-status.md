@@ -1110,6 +1110,121 @@ flow, fetch-failure resilience, two-round cap), `test/app-proactive-drain.test.j
 (end-to-end wiring through `app.js`), `test/proactive-result-schema.test.js`
 (renamed enum value).
 
+### Task #12 revision — the above was still a re-read, not a real on-demand trigger
+
+Real gap caught by vv, same session: `getLatestScreenContext()` just
+re-queried whatever `KekeAccessibilityService` had *already* passively
+collected (subject to its normal 15s cooldown / 2.5s post-switch debounce) —
+"a different query shape of old data," not "command the phone to look right
+now." If vv hadn't switched apps recently, round 2 could hand the model a
+stale read with no way to know how stale. Renaming `need_vision` to
+`need_context` fixed the *label* but not this.
+
+**Real fix, built this pass**: a genuine on-demand round trip. Investigated
+transport options empirically (live websocket probe, 2026-08-09) before
+picking one:
+- `companion_events` has **no Realtime replication enabled** — a real
+  `postgres_changes` subscribe attempt got back `"Unable to subscribe... 
+  Please check Realtime is enabled"`. Confirmed this isn't a client-side
+  mistake by subscribing to `keke_state` the same way in the same script —
+  that one subscribed cleanly (`"Subscribed to PostgreSQL"`). No DDL/dashboard
+  access available to flip replication on for a new table this session.
+- So the request side reuses `keke_state`'s already-confirmed-working
+  Realtime channel instead: `pet-state.js`'s new `requestContextSnapshot({requestId})`
+  PATCHes `{expression: "__context_request__", bubble_text: requestId}` —
+  `pet.html`'s `applyState()` intercepts that exact magic `expression` value
+  *before* it ever reaches `setState`/`showBubble` (never rendered as a real
+  expression or a garbled bubble), and forwards `requestId` to
+  `window.AndroidPet.requestContextSnapshot()`. That's a new `PetBridge`
+  method in `OverlayService.kt` that broadcasts
+  `com.keke.overflow.CONTEXT_SNAPSHOT_REQUEST` (same pattern as the existing
+  `takeScreenshot()`), which `KekeAccessibilityService` handles by scanning
+  the *current* foreground window immediately — bypassing `CONTEXT_COOLDOWN`/
+  `SCAN_DELAY` entirely, since "look right now" is the whole point.
+- The response side stays on `companion_events` (still no Realtime, but
+  that's fine — nothing needs to *push* the response, Cyberboss just polls
+  for it): the device always writes exactly one row tagged
+  `event=context_snapshot` with `detail.requestId` matching, whether or not
+  its own privacy filter withheld the content (see next section) — so
+  Cyberboss's `companion-observation.js`'s new `getContextSnapshot({requestId,
+  timeoutMs, pollIntervalMs})` polls (default 1.5s interval, 15s cap,
+  `CYBERBOSS_CONTEXT_SNAPSHOT_TIMEOUT_MS`/`_POLL_INTERVAL_MS` overrides) and
+  returns as soon as any row with that id shows up. Times out (throws) if the
+  device never answers — screen off, WebView backgrounded, app not running,
+  are all real possibilities on a personal phone; `proactive-turn-runner.js`
+  already treats a `fetchRefreshedContext` rejection as an `{error}` marker
+  for round 2, unchanged from before.
+- `app.js`'s `fetchRefreshedContext` now generates a `crypto.randomUUID()`,
+  calls `requestContextSnapshot` then `getContextSnapshot` with it — replacing
+  the old direct `getLatestScreenContext()` call, which is gone (no longer
+  exported from `companion-observation.js`).
+- `proactive-turn-builder.js`'s round-2 rendering changed shape to match:
+  `refreshedContext` is now a single `{detail, created_at}` row (the device's
+  direct answer), not an array of recent rows. `detail.filtered` renders as
+  "(device looked, but withheld it — `<reason>`)", distinct from
+  `{error}`'s "(unavailable)" — a filtered answer is real information (the
+  device saw the request and made a call), a timeout/error is not.
+
+### Accessibility snapshot privacy rules (`keke-overflow`, this pass)
+
+New `AccessibilityPrivacyFilter.kt`, shared by both the passive `scanContext`
+(pre-existing) and the new on-demand `handleContextSnapshotRequest` — one set
+of rules, not two to keep in sync:
+- **Sensitive app keyword denylist** (bank/pay/wallet/password
+  manager/health, substring match on lowercased package name — a curated
+  keyword list, not an exhaustive package allowlist, since the latter is
+  impossible to keep complete). Matched apps: no title/url extraction, and
+  the passive path writes nothing at all for them (Tasker's
+  `activity_snapshot.current_app` already independently covers "which app is
+  foreground," so keke-overflow doesn't need to redundantly confirm presence
+  for a sensitive app just to satisfy that signal).
+- **微信正文边界** (vv's explicit ask): `com.tencent.mm` is in a separate
+  exact-match `NO_TEXT_EXTRACTION_PACKAGES` set — chat previews/contact names
+  are the other person's content, not vv's own activity, so title extraction
+  is fully suppressed for WeChat regardless of screen. Structured as an
+  extensible set (comment invites adding other IM apps the same way) rather
+  than hardcoding "just WeChat" into the logic.
+- **Password/input field exclusion**: `collectEditTextContent` (used for
+  browser-address-bar detection) now skips any node with `isPassword == true`
+  — app-level filtering alone doesn't cover a login screen embedded inside an
+  otherwise-unlisted app.
+- **Truncation**: unchanged, reuses the existing `TITLE_MAX_LEN = 60` /
+  `truncate()` for both passive and on-demand paths.
+- **Ephemeral, not long-term**: `context_snapshot` events were already
+  excluded from `companion_segments`' narrative (the aggregator's `aggregate()`
+  only branches on known event types — an unrecognized type contributes
+  nothing beyond a bare count). Added a real deletion step this pass:
+  `keke-companion-aggregate.py` (server-side, `~/scripts/`, hourly cron) now
+  runs `cleanup_context_snapshots()` first thing every invocation — deletes
+  `context_snapshot` rows older than 1h, unconditionally, even on the
+  early-return paths (no events / no segments that hour). Verified live
+  against the real table (ran the function directly, no errors, i.e. checked
+  the DELETE query itself is valid before relying on cron to exercise it).
+- **On-demand always answers, even when filtered**: unlike the passive path
+  (which just writes nothing when suppressed), `handleContextSnapshotRequest`
+  always writes a `context_snapshot` row — `{filtered: true, filterReason}`
+  when withheld — because Cyberboss is actively polling and waiting for a
+  specific `requestId`; silence would just burn the full timeout for no
+  reason instead of getting a fast, honest "I looked, can't share it" answer.
+
+**Verified this pass, empirically, against the real `dgovslksweabcsvnipij`
+project** (anon key, same one this code ships with): `companion_events`
+accepts anon INSERT (201) and DELETE (204) — both needed by this design and
+neither previously exercised from outside the Android app/aggregate script;
+the `detail->>requestId=eq.<id>` PostgREST jsonb filter syntax returns the
+right row. All test rows created during this investigation were deleted
+immediately after.
+
+**Not verified this pass — no test infrastructure exists in the Android
+project** (`app/src/test`/`app/src/androidTest` don't exist) and this
+environment can't run `./gradlew` (`keke-overflow/CLAUDE.md`: build only via
+CI, no local Android SDK). GitHub Actions confirming `assembleDebug` succeeds
+is compile-level assurance only — it does not exercise the broadcast/JS
+bridge/Realtime-interception round trip on a real device. That needs a real
+side-load + manual WeChat trigger, which vv would need to do (the app updates
+via its own in-app "check for update" button, not automatically — pulling a
+new APK from CI doesn't install it on its own).
+
 ### Session 4 close-out
 
 - Full suite: **231/231** (`npm test`, dev tree), **230/231 + 1 skipped**

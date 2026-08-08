@@ -94,7 +94,7 @@ test("send_message end to end: WeChat send called, keke_state pushed, lastAgentM
   assert.ok(state.lastAgentMessageAt, "lastAgentMessageAt 应该被更新");
 });
 
-test("need_context end to end: app.js fetches via companionObservationClient.getLatestScreenContext for round 2", async () => {
+test("need_context end to end: app.js pushes a real requestId via petStateClient, then polls companionObservationClient for the device's answer", async () => {
   const app = buildApp({ allowedSenderId: "user1" });
   enqueueOne(app);
 
@@ -108,14 +108,18 @@ test("need_context end to end: app.js fetches via companionObservationClient.get
     }
     return { structuredResult: { action: "silent", message: null, reason: "still nothing after refresh" } };
   };
+  let requestedId = null;
+  app.petStateClient.requestContextSnapshot = async ({ requestId }) => { requestedId = requestId; };
   let fetchCalled = false;
-  app.companionObservationClient.getLatestScreenContext = async () => {
+  app.companionObservationClient.getContextSnapshot = async ({ requestId }) => {
     fetchCalled = true;
-    return [{ created_at: "2026-08-09T12:00:00Z", detail: { package: "com.tencent.mm" } }];
+    assert.equal(requestId, requestedId, "轮询用的 requestId 应该和刚推送的是同一个");
+    return { created_at: "2026-08-09T12:00:00Z", detail: { requestId, package: "com.android.chrome" } };
   };
 
   const result = await app.runProactiveDrainTick();
 
+  assert.ok(requestedId, "应该真的推送了一个 requestId，不是老的被动重读");
   assert.equal(fetchCalled, true);
   assert.equal(calls, 2);
   assert.match(prompts[1], /Refreshed Accessibility context/);

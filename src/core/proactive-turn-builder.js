@@ -5,17 +5,21 @@
 // (proactive-result-schema.js: send_message/silent/need_context/defer)
 // instead of upstream's free-form {"action":"silent"|"send_message"} JSON.
 //
-// Two-round relay (task #12, this session): round 1 gets `refreshedContext`
-// undefined and may answer `need_context`; round 2 (proactive-turn-runner.js,
-// after fetching a fresher on-demand Accessibility read) passes
-// `refreshedContext` and the prompt drops `need_context` from the menu
-// entirely — this is a hard cap at two rounds, not a suggestion left to the
-// model's judgment, so a model that keeps asking can't turn one wake-up into
-// an unbounded chain of Claude calls. `refreshedContext` is raw
-// `companion_events` rows (package/activity/title/sanitized-url), never an
-// image — task #12 deliberately chose "refresh the existing text signal on
-// demand" over building real screenshot transport (see
-// proactive-result-schema.js's `need_context` comment for the full rationale).
+// Two-round relay (task #12): round 1 gets `refreshedContext` undefined and
+// may answer `need_context`; round 2 (proactive-turn-runner.js, after a real
+// on-demand device round trip — see companion-observation.js's
+// getContextSnapshot) passes `refreshedContext` and the prompt drops
+// `need_context` from the menu entirely — a hard cap at two rounds, not a
+// suggestion left to the model's judgment, so a model that keeps asking
+// can't turn one wake-up into an unbounded chain of Claude calls.
+// `refreshedContext` is a single `companion_events` row (`{detail,
+// created_at}`) the device wrote in direct response to this turn's request —
+// `detail` may carry real `package`/`activity`/`title`/sanitized `url`, or
+// `filtered: true` + `filterReason` if the device's own privacy rules
+// suppressed it (see keke-overflow's AccessibilityPrivacyFilter.kt) — never
+// an image (task #12 chose "refresh the existing text signal on demand" over
+// building real screenshot transport; see proactive-result-schema.js's
+// `need_context` comment for the full rationale).
 
 function buildProactiveTurnPrompt(bundle, { refreshedContext } = {}) {
   const isRound2 = refreshedContext !== undefined;
@@ -97,20 +101,23 @@ function formatSegmentsSection(segments) {
   return `Recent companion segments:\n${lines.join("\n")}`;
 }
 
-// Raw companion_events rows (event=screen_context), not the hourly-aggregated
-// companion_segments — this is what "fresher, fuller" actually means: the
-// same package/activity/title/sanitized-url fields KekeAccessibilityService
-// already collects (commit b0f7483), just read on demand and unsmoothed by
-// the aggregator's cooldown/dedupe, instead of a new capture on the device.
+// A single companion_events row (event=context_snapshot) the device wrote in
+// direct, real-time response to this turn's on-demand request — not a
+// re-read of whatever was last passively collected. `detail.filtered` means
+// the device saw the request and looked, but its own privacy rules withheld
+// the content (sensitive app, or a package like WeChat that never yields
+// message-body text) — that's a real, informative answer, not a failure, so
+// it's rendered distinctly from "(unavailable)" (which means the request
+// itself never got a response — device unreachable, timeout, etc.).
 function formatRefreshedContextSection(refreshedContext) {
   if (!refreshedContext || refreshedContext.error) {
     return `Refreshed Accessibility context: (unavailable${refreshedContext?.error ? ` — ${refreshedContext.error}` : ""})`;
   }
-  if (!Array.isArray(refreshedContext) || refreshedContext.length === 0) {
-    return "Refreshed Accessibility context: (none)";
+  const detail = refreshedContext.detail || {};
+  if (detail.filtered) {
+    return `Refreshed Accessibility context: (device looked, but withheld it — ${detail.filterReason || "filtered"})`;
   }
-  const lines = refreshedContext.map((row) => `- ${row.created_at}: ${JSON.stringify(row.detail || {})}`);
-  return `Refreshed Accessibility context:\n${lines.join("\n")}`;
+  return `Refreshed Accessibility context (as of ${refreshedContext.created_at}): ${JSON.stringify(detail)}`;
 }
 
 module.exports = { buildProactiveTurnPrompt };

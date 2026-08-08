@@ -300,11 +300,25 @@ class CyberbossApp {
       for (const message of drained) {
         const result = await processProactiveMessage(message, {
           callRuntime: (prompt) => this.runtimeAdapter.sendSingleTurn({ text: prompt, resultSchema: PROACTIVE_RESULT_JSON_SCHEMA }),
-          // Task #12 round 2: a fresher, unsmoothed read of the same raw
-          // package/activity/title/URL signal KekeAccessibilityService
-          // already collects — never a screenshot/image, see
-          // companion-observation.js's getLatestScreenContext comment.
-          fetchRefreshedContext: () => this.companionObservationClient.getLatestScreenContext(),
+          // Task #12 round 2: a real on-demand request, not a re-read of
+          // whatever was last passively collected (that was this session's
+          // first pass — corrected once flagged). Push a fresh requestId via
+          // keke_state's Realtime channel (pet-state.js), then poll
+          // companion_events for the device's answer (companion-observation.js)
+          // — bounded by config.contextSnapshotTimeoutMs, so an unreachable
+          // device degrades to an error the round-2 prompt renders as
+          // "(unavailable)" rather than hanging the drain tick. Never a
+          // screenshot/image — see AccessibilityPrivacyFilter.kt on the
+          // device side for what does and doesn't get captured.
+          fetchRefreshedContext: async () => {
+            const requestId = crypto.randomUUID();
+            await this.petStateClient.requestContextSnapshot({ requestId });
+            return this.companionObservationClient.getContextSnapshot({
+              requestId,
+              timeoutMs: this.config.contextSnapshotTimeoutMs,
+              pollIntervalMs: this.config.contextSnapshotPollIntervalMs,
+            });
+          },
           sendMessage: (text) => this.channelAdapter.sendText({ userId: allowedSenderId, text }).then(() => true).catch((error) => {
             console.error(`[cyberboss] proactive send failed: ${formatErrorMessage(error)}`);
             return false;

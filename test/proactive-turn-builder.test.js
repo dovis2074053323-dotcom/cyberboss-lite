@@ -12,27 +12,29 @@ test("round 1 (no refreshedContext): includes the narrow-contract JSON examples 
   assert.match(prompt, /"action":"defer"/);
 });
 
-test("round 2 (refreshedContext given): drops need_context from the menu entirely, renders the refreshed rows", () => {
+test("round 2 (refreshedContext given): drops need_context from the menu entirely, renders the device's real answer", () => {
   const prompt = buildProactiveTurnPrompt({}, {
-    refreshedContext: [{ created_at: "2026-08-09T12:00:00Z", detail: { package: "com.tencent.mm", activity: "ChattingUI" } }],
+    refreshedContext: { created_at: "2026-08-09T12:00:00Z", detail: { package: "com.android.chrome", activity: "MainActivity", title: "some page" } },
   });
   assert.match(prompt, /round 2/);
-  assert.match(prompt, /Refreshed Accessibility context:\n- 2026-08-09T12:00:00Z: {"package":"com\.tencent\.mm","activity":"ChattingUI"}/);
+  assert.match(prompt, /Refreshed Accessibility context \(as of 2026-08-09T12:00:00Z\): {"package":"com\.android\.chrome","activity":"MainActivity","title":"some page"}/);
   assert.match(prompt, /"action":"send_message"/);
   assert.match(prompt, /"action":"silent"/);
   assert.match(prompt, /"action":"defer"/);
   assert.doesNotMatch(prompt, /"action":"need_context"/);
 });
 
-test("round 2 with an error marker renders (unavailable), still drops need_context", () => {
-  const prompt = buildProactiveTurnPrompt({}, { refreshedContext: { error: "companion down" } });
-  assert.match(prompt, /Refreshed Accessibility context: \(unavailable — companion down\)/);
+test("round 2 with an error marker renders (unavailable) — the request itself never got a response", () => {
+  const prompt = buildProactiveTurnPrompt({}, { refreshedContext: { error: "timed out waiting for context_snapshot response" } });
+  assert.match(prompt, /Refreshed Accessibility context: \(unavailable — timed out waiting for context_snapshot response\)/);
   assert.doesNotMatch(prompt, /"action":"need_context"/);
 });
 
-test("round 2 with an empty array renders (none)", () => {
-  const prompt = buildProactiveTurnPrompt({}, { refreshedContext: [] });
-  assert.match(prompt, /Refreshed Accessibility context: \(none\)/);
+test("round 2 with detail.filtered renders the device's real (withheld) answer, distinct from (unavailable)", () => {
+  const prompt = buildProactiveTurnPrompt({}, {
+    refreshedContext: { created_at: "2026-08-09T12:00:00Z", detail: { requestId: "r1", package: "com.tencent.mm", filtered: true, filterReason: "no_text_extraction_package" } },
+  });
+  assert.match(prompt, /Refreshed Accessibility context: \(device looked, but withheld it — no_text_extraction_package\)/);
 });
 
 test("renders open loops and core memory as bullet lists when present", () => {

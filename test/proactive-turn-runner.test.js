@@ -113,7 +113,7 @@ test("need_context: fetches refreshed Accessibility context and runs a real roun
     },
     fetchRefreshedContext: async () => {
       fetchCalls.push(true);
-      return [{ created_at: "2026-08-09T12:00:00Z", detail: { package: "com.tencent.mm" } }];
+      return { created_at: "2026-08-09T12:00:00Z", detail: { package: "com.android.chrome", activity: "MainActivity" } };
     },
     sendMessage: async (text) => { sent.push(text); return true; },
   }));
@@ -122,7 +122,7 @@ test("need_context: fetches refreshed Accessibility context and runs a real roun
   assert.equal(prompts.length, 2);
   assert.doesNotMatch(prompts[0], /Refreshed Accessibility context/);
   assert.match(prompts[1], /Refreshed Accessibility context/);
-  assert.match(prompts[1], /com\.tencent\.mm/);
+  assert.match(prompts[1], /com\.android\.chrome/);
   assert.equal(result.action, "send_message");
   assert.deepEqual(sent, ["在忙嘛"]);
 });
@@ -141,6 +141,26 @@ test("need_context: fetchRefreshedContext throwing still proceeds to round 2 wit
 
   assert.equal(prompts.length, 2);
   assert.match(prompts[1], /Refreshed Accessibility context: \(unavailable — companion supabase down\)/);
+  assert.equal(result.action, "silent");
+});
+
+test("need_context: device responded but its own privacy filter withheld the content — a real answer, not a timeout", async () => {
+  const prompts = [];
+  const result = await processProactiveMessage(baseMessage(), stubs({
+    callRuntime: async (prompt) => {
+      prompts.push(prompt);
+      return prompts.length === 1
+        ? { structuredResult: { action: "need_context", message: null, reason: "r" } }
+        : { structuredResult: { action: "silent", message: null, reason: "can't tell, respecting the filter" } };
+    },
+    fetchRefreshedContext: async () => ({
+      created_at: "2026-08-09T12:00:00Z",
+      detail: { requestId: "r1", package: "com.tencent.mm", filtered: true, filterReason: "no_text_extraction_package" },
+    }),
+  }));
+
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1], /device looked, but withheld it — no_text_extraction_package/);
   assert.equal(result.action, "silent");
 });
 
