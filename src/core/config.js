@@ -26,8 +26,8 @@ function readConfig() {
     accountsDir: path.join(stateDir, "accounts"),
     syncBufferDir: path.join(stateDir, "sync-buffers"),
 
-    // 10s bubble-merge window (spec 五) and single-flight turn timeout (spec 五: 180s hard cap).
-    inboundMergeWindowMs: readIntEnv("CYBERBOSS_INBOUND_MERGE_WINDOW_MS") || 10_000,
+    // Single-flight turn timeout (spec 五: 180s hard cap). Bubble-merge timing
+    // itself moved to inboundIdleDelayMs/inboundMaxWaitMs below (session 3).
     claudeTurnTimeoutMs: readIntEnv("CYBERBOSS_CLAUDE_TURN_TIMEOUT_MS") || 180_000,
 
     claudeCommand: readTextEnv("CYBERBOSS_CLAUDE_COMMAND") || "claude",
@@ -50,6 +50,23 @@ function readConfig() {
     // spec §6: real proactive reminder/check_in sending stays off until session 3
     // wires the host-wide try-lock; resume_topic (no proactive send) can be live.
     enableScheduledIntentions: readBoolEnv("CYBERBOSS_ENABLE_SCHEDULED_INTENTIONS", false),
+
+    // Session 3: shared cross-project /run/agent-runtime/claude.lock (protocol in
+    // Morrow's docs/agent-runtime-lock.md). Overridable dir only so tests can point
+    // at a tmpdir instead of the real tmpfs path.
+    hostLockDir: readTextEnv("CYBERBOSS_HOST_LOCK_DIR") || "/run/agent-runtime",
+    // Real WeChat turns may *wait* for the lock (Morrow is mid-turn) before
+    // failing — no one is staring at a spinner the way Morrow's chat UI is, so
+    // this is intentionally longer than Morrow's own 45s turn-lock wait.
+    hostLockWaitMs: readIntEnv("CYBERBOSS_HOST_LOCK_WAIT_MS") || 60_000,
+
+    // Bubble merge (spec 五), tuned in session 3: idle-debounce + hard cap
+    // instead of a flat 10s wait. idleDelay resets on every new message in the
+    // batch; maxWait is set once from the first message and never resets —
+    // whichever fires first flushes. A lone message now merges in ~idleDelay,
+    // not a flat 10s.
+    inboundIdleDelayMs: readIntEnv("CYBERBOSS_INBOUND_IDLE_DELAY_MS") || 1_800,
+    inboundMaxWaitMs: readIntEnv("CYBERBOSS_INBOUND_MAX_WAIT_MS") || 3_500,
   };
 }
 

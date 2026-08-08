@@ -17,7 +17,8 @@
     "login": "node ./bin/cyberboss.js login",
     "doctor": "node ./bin/cyberboss.js doctor",
     "help": "node ./bin/cyberboss.js help",
-    "check": "find src bin -name '*.js' -exec node --check {} +"
+    "check": "find src bin -name '*.js' -exec node --check {} +",
+    "test": "node --test \"test/*.test.js\""
   },
   "dependencies": {
     "dotenv": "^16.4.7",

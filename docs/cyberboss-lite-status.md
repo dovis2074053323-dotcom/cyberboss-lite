@@ -567,23 +567,197 @@ one more preflight call, at systemd unit start (before the bridge loop begins
 accepting messages) — still not a recurring heartbeat, just one more
 call site of the same synchronous check.
 
-## For session 3
+## Session 3 (real host lock, bubble-merge retune, systemd) — in progress
 
-Session 3 scope per `docs/session-2-spec.md`: Pulse, Tasker observation,
-systemd unit, the real Morrow-side `/run/agent-runtime` host flock (the
-`hostLock.tryAcquire()` stub in `app.js` and the non-blocking try-lock contract
-`executeDueIntentions` already expects are both waiting for this), and only
-then flip `CYBERBOSS_ENABLE_SCHEDULED_INTENTIONS=true` for real reminder/
-check_in proactive sending. Also add one ACL preflight call at systemd unit
-start (see "Credential ACL" section above) — not a new mechanism, just one
-more call site of the existing `sendSingleTurn` preflight, run once before the
-bridge loop starts accepting messages.
+No written spec doc for session 3 exists (unlike session 2's committed
+`docs/session-2-spec.md`) — scope came directly from vv in chat, in this
+order: real host lock → WeChat-turn blocking wait → Pulse/intentions
+non-blocking try-lock → status.json stays observation-only → bubble-merge
+retune → systemd → startup ACL preflight → crash/restart verification →
+Pulse + Tasker observation → flip `CYBERBOSS_ENABLE_SCHEDULED_INTENTIONS`.
+**Pulse and Tasker observation are still open** — see the dedicated section
+below; everything else in that list is done and verified live.
 
-The temporary listener started for this session's live verification was
-stopped cleanly (`SIGTERM`) at the end of the session — same as session 1,
-there is no systemd unit, so nothing is left running as an unmanaged process
-between sessions. Start it the same way session 1 documented: `sudo -u
-cyberboss bash -c 'setsid /srv/cyberboss-lite/state/run-start.sh >
-/srv/cyberboss-lite/state/start.log 2>&1 < /dev/null &'` (redirect must happen
-*inside* the `sudo -u` shell, not before it, or it fails with a permission
-error writing to a `cyberboss`-owned log file as `keke`).
+### Real host lock (spec: Morrow's `docs/agent-runtime-lock.md`)
+
+`src/core/host-lock.js` — a direct CommonJS port of Morrow's
+`flock -F -w <timeoutSec> -E 42 <lockfile> /bin/cat` + stdin-sentinel-handshake
+protocol (that doc is the one source of truth for the mechanism; this side
+didn't redesign anything, just implemented the already-agreed "Cyberboss
+session 3 接入协议" section of it). Two entry points instead of Morrow's one,
+because the two call sites have genuinely different semantics:
+
+- `acquireHostLock({ lockDir, kind, timeoutMs })` — blocking with a real
+  timeout (kernel `alarm(2)` via `flock -w`, not polling). Used by real WeChat
+  turns (`flushPendingBatch` in `app.js`): "可以等待锁，超时后失败" — Morrow
+  might be mid-turn, nobody is staring at a WeChat spinner the way Morrow's
+  chat UI is, so it's fine to wait, just not forever
+  (`config.hostLockWaitMs`, default 60s, vs. Morrow's own 45s chat-facing
+  wait). Failure (`HostLockBusyError`/`HostLockSystemError`) is caught by the
+  same existing `catch` block every other turn failure already goes through —
+  no new failure path, typing indicator still stops, turn gate still releases.
+- `tryAcquireHostLock({ lockDir, kind })` — non-blocking (`-w 0`), used
+  wherever the contract is "never wait, never preempt Morrow, just skip this
+  tick if busy." Both `HostLockBusyError` and `HostLockSystemError` normalize
+  to `{ acquired: false }` here — the caller only needs a boolean, busy is the
+  expected/common case and a system error just gets an extra `console.error`
+  for ops visibility. This is exactly the `tryLock` shape
+  `executeDueIntentions` already had fake-clock/fake-lock tests locked onto
+  from session 2 — the real implementation slots in with no interface change.
+
+`status.json` shape matches Morrow's 6 fields exactly, `owner: "cyberboss"`.
+Confirmed both sides can never disagree about what "the lock" is — same file,
+same protocol, no code sharing needed because the protocol doc is language-
+agnostic by design.
+
+**Verified against the real deployed system, not just tmpdir unit tests**:
+`cyberboss` really can flock `/run/agent-runtime/claude.lock` (already true
+before this session, provisioned when Morrow wired its side in — see
+`[[cyberboss-morrow-shared-claude]]`-adjacent work); ownership/mode on the
+real path (`root:agent-runtime 2775` dir, `root:agent-runtime 664` lockfile)
+confirmed read-only (deliberately did **not** `rm -rf`/recreate the real
+tmpfs path from a test — that path is live production shared with Morrow,
+recreating it mid-test would be destructive to whatever either side is
+actually doing at the time). `test/host-lock.test.js`'s two real-path tests
+are read-only assertions plus a try-lock probe that gracefully treats "busy
+because Morrow itself is running this test right now" as an observed-not-
+failed outcome (self-referential: the process running the test suite may
+itself be the Morrow session holding the lock).
+
+### app.js wiring
+
+- `flushPendingBatch`: lock acquisition moved inside the existing `try`
+  block (was an unconditional stub-acquire before the `try`). A lock
+  failure — busy-after-timeout or a system error — is indistinguishable from
+  any other turn failure to the rest of the function: same `catch`, same
+  typing-stop, same turn-gate release, same `logPayload.isError = true`. Only
+  addition is a more specific `console.error` line distinguishing
+  `HostLockBusyError`/`HostLockSystemError`/other for ops readability.
+- `runDueIntentionsCheck()` (new method): the actual, real, non-Claude-
+  calling caller of `executeDueIntentions` — loads `intentionsStore`, calls
+  it with `tryAcquireHostLock` as `tryLock` and a plain WeChat `sendText` as
+  `sendFn`, saves the resulting state back. Gated by
+  `config.enableScheduledIntentions` (still `false`). **Nothing calls this
+  method yet** — see "Pulse + Tasker observation" below for why; the method
+  itself is complete, tested indirectly via `executeDueIntentions`'s own
+  session-2 fake-lock tests plus this session's real `host-lock.js`.
+  **Interpretation call**: `sendFn`'s message text is
+  `intention.reason` (+ `\n` + `intention.context` if present) — `sendFn`
+  must be plain delivery, never a second Claude call (spec §6: "定时执行不得
+  递归创建新 intention、memory 或 handoff"), so the outbound text has to come
+  straight from data the model already wrote at creation time; `reason` is
+  the closest thing to "what to say" without a rephrase call.
+
+### Bubble-merge retune: idle-debounce + hard cap, replacing the flat 10s
+
+`config.inboundIdleDelayMs` (default 1800) / `config.inboundMaxWaitMs`
+(default 3500) replace the old single `inboundMergeWindowMs` (was a flat
+10000 for every batch, including a single lone message). New behavior in
+`bufferInboundMessage`/`scheduleMergeFlush`/`triggerMergeFlush`:
+
+- `idleTimer` resets on **every** message in the batch (debounce — keep
+  waiting while bubbles are still arriving).
+- `maxWaitTimer` is armed **once**, on the first message of a new batch, and
+  never reset (hard cap — a steady trickle can't push the flush out
+  indefinitely).
+- Whichever fires first wins; the other is cleared so there's never a double
+  flush.
+- A single lone message now merges in ~1.8s, not a flat 10s.
+
+**Explicitly untouched, per vv's instruction**: the in-flight
+`pendingMessages` recursive-flush path (messages arriving while a turn is
+already running skip merge timers entirely and flush immediately once the
+gate frees — spec 四) — `bufferInboundMessage`'s early-return branch when
+`turnGateStore.isPending(...)` is true still does exactly what it did before,
+verified by a dedicated test (`test/app-bubble-merge.test.js`, "正在跑的 turn
+期间到达的消息不设任何合并计时器").
+
+### systemd
+
+`deploy/cyberboss.service`, installed to `/etc/systemd/system/cyberboss.service`,
+`EnvironmentFile=/etc/cyberboss.env` (root:root 0600, holds
+`CYBERBOSS_STATE_DIR`/`CYBERBOSS_SHARED_CREDENTIALS_FILE`/
+`CYBERBOSS_ENABLE_SCHEDULED_INTENTIONS=false`, mirrors the pre-existing
+`run-start.sh`'s two vars plus the explicit off-switch). `User=cyberboss`,
+`WorkingDirectory=/srv/cyberboss-lite/app`, `Restart=always`.
+**`NoNewPrivileges=false` is required, not optional** — the credential-ACL
+preflight runs `sudo -n -u keke ...`, and `sudo` is a setuid-root binary;
+`NoNewPrivileges=true` would make the kernel refuse that privilege gain
+outright, silently breaking every turn for the wrong reason (looks like an
+ACL problem, is actually a systemd sandboxing problem). Caught this before
+it ever shipped, not after a live failure — mirrors Morrow's own unit file,
+which has the same flag for a related reason (its own sudo-gated tool
+approvals). `MemoryHigh=300M`/`MemoryMax=450M` are a first-pass conservative
+estimate given the box's real headroom at write time (~986M "available", per
+`free -h`, with Morrow alone able to spike to 900M) — not load-tested against
+real sustained WeChat traffic yet.
+
+Startup ACL preflight: `CyberbossApp.start()` now calls the same
+`runAclPreflightOrThrow()` the per-turn runtime adapter already used,
+**before** `resolveAccount()`/the polling loop — fail-closed with
+`process.exit(1)` on failure, same pattern as the existing store-corruption
+fail-closed exit right above it. Not a new mechanism, exactly what the
+session-2 status doc's "For session 3" note already called for: one more
+call site of the existing check.
+
+Installed and verified live: `systemctl enable --now cyberboss.service`
+came up clean (`acl preflight ok` → `bootstrap ok` → `bridge loop started`),
+deployed copy synced via the same `rsync -a --delete --exclude=node_modules
+--exclude=.git` + `node_modules` rsync (no dependency changes this session)
+pattern session 2 used, `npm run check` + `npm test` (125/125, 1 skipped —
+the real-path try-lock test skips when the runner itself has no passwordless
+sudo, e.g. when run as `cyberboss`) both clean as `cyberboss` on
+`/srv/cyberboss-lite/app` before starting anything.
+
+**Crash-safety, verified two ways**:
+1. Isolated (`test/host-lock.test.js`, tmpdir-scoped, mirrors Morrow's own
+   `claude-lock.test.js` fixture pattern exactly): a real independent OS
+   process (`test/fixtures/host-lock-holder-sim.js`) acquires the lock,
+   prints its holder pid, hangs; the test `kill -9`s the *simulator* process
+   (not the holder — the holder is a child `flock`/`cat` process spawned by
+   the simulator, exactly mirroring "Cyberboss's real main process getting
+   OOM-killed"), confirms the holder pid exits on its own within 3s (kernel
+   closing the inherited stdin pipe write-end → `cat` reads EOF → exits →
+   `flock` releases), then confirms a fresh `acquireHostLock` succeeds
+   immediately after.
+2. Live, against the actual systemd-managed process on the real
+   `/run/agent-runtime` path (deliberately **not** while it held the lock —
+   see "Real host lock" above for why the live shared file wasn't used for
+   the kill itself): `sudo kill -9 <MainPID>` while `cyberboss.service` was
+   idle, confirmed `Restart=always` brought up a fresh PID within the
+   `RestartSec=5` window, and confirmed `current-state.json`,
+   `episodes/current.json` (**same `episodeId`**), `intentions.json`, and
+   `sender-allowlist.json` (**no re-bootstrap**) were all byte-for-byte
+   identical before and after — the fail-closed store-loading path from
+   session 2 (`loadAllStoresOrExit`) handled the restart with zero special
+   handling needed.
+
+### Pulse + Tasker observation — still open, needs a real spec before writing code
+
+Neither `docs/session-2-spec.md` (explicitly excludes both) nor the session-2
+status doc's "For session 3" note (only names them as headings) define what
+either one actually *is*: what triggers a Pulse tick, what "Tasker
+observation" observes or how it's delivered to this process, what either one
+is allowed to do once triggered (call Claude? just check due intentions?),
+or how "event-first, not a high-frequency poller" cashes out concretely.
+`runDueIntentionsCheck()` (see above) is the ready-to-call execution side —
+whatever Pulse turns out to be, it very likely just needs to call that
+method — but nothing calls it yet, and no scheduler/trigger exists. Asked vv
+for the concrete spec before guessing at a design that could end up sending
+real proactive WeChat messages on the wrong trigger.
+
+### Remaining before this session can close
+
+- Pulse + Tasker observation design + implementation (blocked on spec above).
+- Flip `CYBERBOSS_ENABLE_SCHEDULED_INTENTIONS=true` in `/etc/cyberboss.env` —
+  code-complete and lock-safe today, but deliberately held for an explicit
+  go-ahead from vv first: this is the one change in this session that turns
+  on real proactive sends to vv's live WeChat account, which is a
+  hard-to-undo, user-visible action, not just a code change.
+- Final acceptance pass once the above land: all 6 scenarios vv listed
+  (Morrow-busy → Cyberboss queues/waits; Morrow-idle → Cyberboss acquires;
+  Cyberboss-busy → Morrow queues; Cyberboss mid-turn + 2-3 WeChat messages →
+  next pending batch; idle + a few messages → merge within 1.5-4s; either
+  side `kill -9`'d → lock auto-releases). The lock/merge/crash-safety pieces
+  of this are already verified individually above; what's outstanding is one
+  combined live pass once Pulse/Tasker/the flag are also in place.

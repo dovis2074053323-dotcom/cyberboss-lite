@@ -241,4 +241,4 @@ function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-module.exports = { createClaudeCodeRuntimeAdapter, buildArgs, parseResult, RESULT_SCHEMA_JSON };
+module.exports = { createClaudeCodeRuntimeAdapter, buildArgs, parseResult, RESULT_SCHEMA_JSON, runAclPreflightOrThrow };

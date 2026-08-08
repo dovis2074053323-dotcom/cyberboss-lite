@@ -9,9 +9,11 @@ const { buildInboundDraft, mergeBufferedInboundTexts, formatWechatLocalTime } = 
 const { createCurrentStateStore } = require("./current-state-store");
 const { createEpisodeStore } = require("./episode-store");
 const { createMemoryStore } = require("./memory-store");
-const { createIntentionsStore } = require("./intentions-store");
+const { createIntentionsStore, executeDueIntentions } = require("./intentions-store");
 const { createTurnCoordinator } = require("./turn-coordinator");
 const { StateCorruptionError } = require("./json-store");
+const { acquireHostLock, tryAcquireHostLock, HostLockBusyError, HostLockSystemError } = require("./host-lock");
+const { runAclPreflightOrThrow } = require("../adapters/runtime/claudecode");
 
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
 const RETRY_DELAY_MS = 2_000;
@@ -21,17 +23,6 @@ const MAX_CONSECUTIVE_FAILURES = 3;
 // Single sender, single workspace: there is exactly one turn-gate scope for the
 // whole process (no per-thread/per-workspace fan-out like upstream Cyberboss).
 const SCOPE_BINDING_KEY = "cyberboss";
-
-// Stub for the session-3 host-wide `/run/agent-runtime` flock. Session 1 only has
-// the in-process TurnGateStore; this hook exists so wiring the real flock later is
-// a local change, not a re-plumbing of app.js. Non-blocking try-lock semantics
-// (spec 四: Pulse/intentions use try-lock and skip when busy) belong here too, once
-// Pulse exists (session 3).
-const hostLock = {
-  async tryAcquire() {
-    return { acquired: true, release: () => {} };
-  },
-};
 
 class CyberbossApp {
   constructor(config) {
@@ -51,7 +42,11 @@ class CyberbossApp {
       intentionsStore: this.intentionsStore,
     });
     this.pendingMessages = [];
-    this.mergeTimer = null;
+    // Bubble merge (session 3 retune): idleTimer resets per message, maxWaitTimer
+    // is set once per batch on the first message and never resets — whichever
+    // fires first flushes. See scheduleMergeFlush/clearMergeTimers.
+    this.idleTimer = null;
+    this.maxWaitTimer = null;
   }
 
   printDoctor() {
@@ -84,6 +79,18 @@ class CyberbossApp {
     // from whatever the user last saw.
     this.loadAllStoresOrExit();
 
+    // Session 3: one more call site of the same synchronous ACL preflight the
+    // runtime adapter already runs before every turn (docs/credential-acl-install.md) —
+    // not a new mechanism, just run once here too so a systemd-started process
+    // fails closed before it ever accepts a WeChat message, instead of only
+    // discovering a stale ACL grant on the first real turn.
+    try {
+      await runAclPreflightOrThrow();
+    } catch (error) {
+      console.error(`[cyberboss] FATAL: startup acl preflight failed: ${formatErrorMessage(error)}`);
+      process.exit(1);
+    }
+
     const account = this.channelAdapter.resolveAccount();
     await this.channelAdapter.loadSyncBuffer();
 
@@ -94,7 +101,7 @@ class CyberbossApp {
     console.log("[cyberboss] bridge loop started; waiting for WeChat messages.");
 
     const shutdown = createShutdownController(async () => {
-      this.clearMergeTimer();
+      this.clearMergeTimers();
     });
 
     try {
@@ -124,7 +131,7 @@ class CyberbossApp {
       }
     } finally {
       shutdown.dispose();
-      this.clearMergeTimer();
+      this.clearMergeTimers();
     }
   }
 
@@ -169,9 +176,13 @@ class CyberbossApp {
     this.bufferInboundMessage(prepared);
   }
 
-  // Spec 五: 10s bubble merge. Spec 四: while a turn is in flight, further messages
-  // collapse into one pending batch and flush only once the gate frees.
+  // Spec 五 bubble merge, session-3 retune: idle-debounce with a hard cap instead
+  // of a flat 10s wait (see scheduleMergeFlush). Spec 四 unchanged: while a turn
+  // is in flight, further messages collapse into one pending batch and flush
+  // immediately (no merge timer at all) once the gate frees — that recursive
+  // flushPendingBatch()-at-the-end path is untouched by this retune.
   bufferInboundMessage(prepared) {
+    const isFirstOfBatch = this.pendingMessages.length === 0;
     this.pendingMessages.push(prepared);
     void this.channelAdapter.sendTyping({
       userId: prepared.senderId,
@@ -183,23 +194,46 @@ class CyberbossApp {
       // A turn is already running; this message waits and will be flushed on release.
       return;
     }
-    this.scheduleMergeFlush();
+    this.scheduleMergeFlush(isFirstOfBatch);
   }
 
-  scheduleMergeFlush() {
-    this.clearMergeTimer();
-    this.mergeTimer = setTimeout(() => {
-      this.mergeTimer = null;
-      void this.flushPendingBatch().catch((error) => {
-        console.error(`[cyberboss] flush failed: ${formatErrorMessage(error)}`);
-      });
-    }, this.config.inboundMergeWindowMs);
+  // idleTimer resets on every message (debounce: keep waiting while the user is
+  // still typing bubbles). maxWaitTimer is armed once, on the first message of a
+  // new batch, and never reset — it's the hard cap so a steady trickle of
+  // messages can't push the flush out indefinitely. Whichever fires first wins;
+  // triggerMergeFlush() clears both so there's never a double flush.
+  scheduleMergeFlush(isFirstOfBatch) {
+    this.clearIdleTimer();
+    if (isFirstOfBatch) {
+      this.clearMaxWaitTimer();
+      this.maxWaitTimer = setTimeout(() => this.triggerMergeFlush(), this.config.inboundMaxWaitMs);
+    }
+    this.idleTimer = setTimeout(() => this.triggerMergeFlush(), this.config.inboundIdleDelayMs);
   }
 
-  clearMergeTimer() {
-    if (this.mergeTimer) {
-      clearTimeout(this.mergeTimer);
-      this.mergeTimer = null;
+  triggerMergeFlush() {
+    this.clearMergeTimers();
+    void this.flushPendingBatch().catch((error) => {
+      console.error(`[cyberboss] flush failed: ${formatErrorMessage(error)}`);
+    });
+  }
+
+  clearMergeTimers() {
+    this.clearIdleTimer();
+    this.clearMaxWaitTimer();
+  }
+
+  clearIdleTimer() {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+  }
+
+  clearMaxWaitTimer() {
+    if (this.maxWaitTimer) {
+      clearTimeout(this.maxWaitTimer);
+      this.maxWaitTimer = null;
     }
   }
 
@@ -219,9 +253,21 @@ class CyberbossApp {
     const sourceTurnId = latest.messageId || `turn_${crypto.randomUUID()}`;
 
     this.turnGateStore.begin(SCOPE_BINDING_KEY, this.config.workspaceRoot);
-    const lock = await hostLock.tryAcquire();
+    let lock = null;
     let logPayload = { mode: "reply", episodeId: "", rolloverReason: "none", isError: false };
     try {
+      // Real WeChat turns may *wait* for the shared cross-project lock (Morrow
+      // could be mid-turn) — no one is staring at a spinner the way Morrow's
+      // chat UI is, so this can afford to wait, but not forever. Busy-after-
+      // timeout and any system error both land in the catch below like any
+      // other turn failure — the whole batch fails cleanly, typing stops, the
+      // turn gate still releases.
+      lock = await acquireHostLock({
+        lockDir: this.config.hostLockDir,
+        kind: "wechat_turn",
+        timeoutMs: this.config.hostLockWaitMs,
+      });
+
       const prepared = await this.turnCoordinator.prepareTurn({
         agentName: this.config.agentName,
         receivedAtIso,
@@ -270,13 +316,21 @@ class CyberbossApp {
       // the user should never be left seeing "typing..." forever.
       await this.channelAdapter.sendTyping({ userId: latest.senderId, status: 0 }).catch(() => {});
     } catch (error) {
-      console.error(`[cyberboss] turn failed: ${formatErrorMessage(error)}`);
+      if (error instanceof HostLockBusyError) {
+        console.error(`[cyberboss] host lock busy after ${this.config.hostLockWaitMs}ms wait, turn dropped: ${formatErrorMessage(error)}`);
+      } else if (error instanceof HostLockSystemError) {
+        console.error(`[cyberboss] host lock system error, turn dropped: ${formatErrorMessage(error)}`);
+      } else {
+        console.error(`[cyberboss] turn failed: ${formatErrorMessage(error)}`);
+      }
       logPayload.isError = true;
       await this.channelAdapter.sendTyping({ userId: latest.senderId, status: 0 }).catch(() => {});
     } finally {
       // Spec §7: never log message bodies, only metadata.
       console.log(JSON.stringify(logPayload));
-      lock.release();
+      if (lock) {
+        await lock.release();
+      }
       this.turnGateStore.releaseScope(SCOPE_BINDING_KEY, this.config.workspaceRoot);
     }
 
@@ -286,6 +340,61 @@ class CyberbossApp {
       await this.flushPendingBatch();
     }
   }
+
+  // Spec §6 execution interface, wired for real in session 3: who actually
+  // *calls* this (Pulse's trigger source) is still open — see docs/cyberboss-lite-status.md
+  // "For session 3" — but the call itself is complete and safe to invoke today:
+  // non-blocking try-lock (never waits, never preempts Morrow — HostLockBusyError
+  // just means "skip this tick"), gated by config.enableScheduledIntentions
+  // (still false until that's explicitly flipped), and sendFn is a plain WeChat
+  // delivery — never a Claude turn, so it can't recursively create intentions/
+  // memory/handoff (spec §6's explicit ban).
+  async runDueIntentionsCheck() {
+    const allowedSenderId = this.senderGate.getAllowedSenderId();
+    if (!allowedSenderId) {
+      return { executed: [], skippedReason: "no_allowed_sender" };
+    }
+
+    const state = this.intentionsStore.load();
+    const result = await executeDueIntentions({
+      store: this.intentionsStore,
+      state,
+      nowMs: Date.now(),
+      enabled: this.config.enableScheduledIntentions,
+      tryLock: () => tryAcquireHostLock({ lockDir: this.config.hostLockDir, kind: "scheduled_intention" }),
+      sendFn: async (intention) => {
+        const text = buildIntentionMessageText(intention);
+        if (!text) {
+          return;
+        }
+        await this.channelAdapter.sendText({ userId: allowedSenderId, text });
+      },
+    });
+
+    if (result.state) {
+      this.intentionsStore.save(result.state);
+    }
+    if (result.executed.length) {
+      // Spec §7: never log message bodies, only metadata.
+      console.log(JSON.stringify({ mode: "scheduled_intention", executed: result.executed }));
+    }
+    return result;
+  }
+}
+
+// Interpretation call (mirrors session 2's documented gap-fills): sendFn must be
+// plain delivery, never a second Claude call, so the outbound text has to come
+// straight from data the model already wrote at creation time. `reason` is the
+// model's own natural-language justification for the intention (spec §6
+// required field) and is the closest thing to "what to say" without a rephrase
+// call; `context` is optional supplementary detail appended when present.
+function buildIntentionMessageText(intention) {
+  const reason = String(intention?.reason || "").trim();
+  const context = String(intention?.context || "").trim();
+  if (!reason) {
+    return "";
+  }
+  return context ? `${reason}\n${context}` : reason;
 }
 
 function sweepStaleClaudeConfigDirs(configDirRoot) {

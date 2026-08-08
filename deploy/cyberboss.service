@@ -1,0 +1,52 @@
+[Unit]
+Description=Cyberboss Lite — WeChat bridge to Claude Code
+After=network.target
+
+[Service]
+Type=simple
+User=cyberboss
+Group=cyberboss
+WorkingDirectory=/srv/cyberboss-lite/app
+
+# HOME must point at cyberboss's own home, not keke's — the shared-credential
+# design gives cyberboss read-only ACL access to one file under keke's ~/.claude,
+# never a HOME override into keke's tree (see docs/cyberboss-lite-status.md
+# "System-level setup" / "Credential ACL").
+Environment=HOME=/home/cyberboss
+Environment=NODE_ENV=production
+# CYBERBOSS_STATE_DIR / CYBERBOSS_SHARED_CREDENTIALS_FILE / (later)
+# CYBERBOSS_ENABLE_SCHEDULED_INTENTIONS live here, not inline — same reasoning
+# as Morrow's /etc/morrow.env: keep deployment-specific values out of the unit
+# file that's tracked in git.
+EnvironmentFile=/etc/cyberboss.env
+
+ExecStart=/usr/bin/node bin/cyberboss.js start
+Restart=always
+RestartSec=5
+
+# This box only has 1.9G total, already shared with Morrow (MemoryHigh=700M/
+# MemoryMax=900M) and other services. Cyberboss's own Node process is a thin
+# WeChat long-poll bridge (no persistent SDK session); the actual `claude` CLI
+# child it spawns per turn is single-shot (`-p`, no streaming/tools) and, by
+# design, can never run concurrently with Morrow's own Claude process — both
+# sides serialize through /run/agent-runtime/claude.lock. Limits here are a
+# first-pass conservative estimate, not load-tested; revisit if turns start
+# getting OOM-killed mid-flight.
+MemoryHigh=300M
+MemoryMax=450M
+
+PrivateTmp=true
+# Must stay false: the credential-ACL preflight (every turn, plus once at
+# startup below) runs `sudo -n -u keke /usr/local/sbin/cyberboss-ensure-claude-credential-acl`.
+# sudo is a setuid-root binary — NoNewPrivileges=true would make the kernel
+# refuse that privilege gain outright, silently breaking every single turn
+# (fail-closed in the adapter, but for the wrong reason). The real boundary
+# here is the one-command, zero-argument, root-owned sudoers rule itself
+# (docs/credential-acl-install.md), not a process-level privilege lockout.
+NoNewPrivileges=false
+
+StandardOutput=append:/srv/cyberboss-lite/state/cyberboss.log
+StandardError=append:/srv/cyberboss-lite/state/cyberboss.log
+
+[Install]
+WantedBy=multi-user.target
