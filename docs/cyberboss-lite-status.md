@@ -1190,16 +1190,29 @@ of rules, not two to keep in sync:
   otherwise-unlisted app.
 - **Truncation**: unchanged, reuses the existing `TITLE_MAX_LEN = 60` /
   `truncate()` for both passive and on-demand paths.
-- **Ephemeral, not long-term**: `context_snapshot` events were already
-  excluded from `companion_segments`' narrative (the aggregator's `aggregate()`
-  only branches on known event types — an unrecognized type contributes
-  nothing beyond a bare count). Added a real deletion step this pass:
-  `keke-companion-aggregate.py` (server-side, `~/scripts/`, hourly cron) now
-  runs `cleanup_context_snapshots()` first thing every invocation — deletes
-  `context_snapshot` rows older than 1h, unconditionally, even on the
-  early-return paths (no events / no segments that hour). Verified live
-  against the real table (ran the function directly, no errors, i.e. checked
-  the DELETE query itself is valid before relying on cron to exercise it).
+- **Ephemeral, not long-term — corrected after a real mistake found late in
+  this pass**: `context_snapshot` events were already excluded from
+  `companion_segments`' narrative (the aggregator's `aggregate()` only
+  branches on known event types — an unrecognized type contributes nothing
+  beyond a bare count) — that part holds. But the deletion step this pass
+  first added does **not** work: `keke-companion-aggregate.py`'s anon key has
+  no `DELETE`/`UPDATE` grant on `companion_events` at all — PostgREST returns
+  `200`/`204` with an **empty** affected-rows array regardless, which reads
+  as "success" unless you check the body, so the first version of this
+  cleanup silently no-op'd forever. (Almost certainly deliberate upstream
+  RLS design, not a bug to route around: `companion_events` is an
+  append-only ledger from the app's perspective; only `companion_segments`
+  is meant to be mutable, which is exactly why the pre-existing
+  `delete("companion_segments", ...)` a few lines up actually works.)
+  `cleanup_context_snapshots()` now just detects and logs stale rows
+  instead of pretending to remove them — real deletion needs vv to add a
+  `DELETE` RLS policy for anon on `companion_events` (scoped to
+  `event = 'context_snapshot'`, not the whole table) via the Supabase
+  dashboard; nothing in this codebase can grant that. Until then,
+  `context_snapshot` rows persist the same way `screen_context` rows
+  already do (same table, same permissions, no prior complaint about that)
+  — the real privacy boundary is what gets *captured* at write time
+  (`AccessibilityPrivacyFilter.kt`), not a retention limit on the ledger.
 - **On-demand always answers, even when filtered**: unlike the passive path
   (which just writes nothing when suppressed), `handleContextSnapshotRequest`
   always writes a `context_snapshot` row — `{filtered: true, filterReason}`
@@ -1209,11 +1222,19 @@ of rules, not two to keep in sync:
 
 **Verified this pass, empirically, against the real `dgovslksweabcsvnipij`
 project** (anon key, same one this code ships with): `companion_events`
-accepts anon INSERT (201) and DELETE (204) — both needed by this design and
-neither previously exercised from outside the Android app/aggregate script;
-the `detail->>requestId=eq.<id>` PostgREST jsonb filter syntax returns the
-right row. All test rows created during this investigation were deleted
-immediately after.
+accepts anon INSERT (confirmed 201, real row created) and the
+`detail->>requestId=eq.<id>` PostgREST jsonb filter syntax returns the right
+row. **DELETE/UPDATE do not work** (see above) — confirmed the hard way:
+first read a `200`/`204` status as success, only caught the mistake by
+re-querying afterward and finding the "deleted" rows still there. **Three
+test rows from this investigation are still sitting in the live
+`companion_events` table** (`event` values `context_request_test`,
+`context_snapshot_test`, `delete_rls_probe`) because nothing available to
+this session can remove them — vv can delete them by hand via the Supabase
+SQL editor (`delete from companion_events where event in
+('context_request_test','context_snapshot_test','delete_rls_probe')`) once
+a `DELETE` policy exists, or just leave them (harmless test rows, no real
+content).
 
 **Not verified this pass — no test infrastructure exists in the Android
 project** (`app/src/test`/`app/src/androidTest` don't exist) and this
@@ -1244,3 +1265,38 @@ new APK from CI doesn't install it on its own).
   data on the live deployment right now. No live WeChat test of an actual
   proactive send. Real screenshot + Vision captioning stays a recorded
   future enhancement (task #12's resolution), not started.
+
+### Session 4, continued — need_context real trigger + env vars lit up
+
+- Full suite: **236/236** (`npm test`, dev tree), **235/236 + 1 skipped**
+  (deployed copy as `cyberboss`, same known try-lock skip). `npm run check`
+  clean on both.
+- `cyberboss-lite` commits `8751ea1` (real `context_snapshot` round trip) and
+  the doc commit for this section, on `lite`, pushed to `origin/lite`.
+- `keke-overflow` commits `903576b` (on-demand trigger + `AccessibilityPrivacyFilter.kt`)
+  and `36fd565` (doc correction), pushed to `origin/main`. CI (`assembleDebug`)
+  confirmed green for `36fd565` — compile-level only, see the "Not verified"
+  note above.
+- `/etc/cyberboss.env` now has all four observation vars
+  (`CYBERBOSS_TASKER_SUPABASE_URL`/`ANON_KEY` — `euweutcweibwfpykzqvu` project,
+  same one `ombre-app` uses; `CYBERBOSS_COMPANION_SUPABASE_URL`/`ANON_KEY` —
+  `dgovslksweabcsvnipij`, same key `SupabaseClient.kt`/
+  `keke-companion-aggregate.py` already use). Redeployed to
+  `/srv/cyberboss-lite/app`, restarted, confirmed `active (running)`,
+  `NRestarts=0`. **Verified live** (ad-hoc script run as root, reading the
+  real env file, calling the real adapters — not a unit test): both
+  `taskerSnapshotClient.getSnapshot()` and
+  `companionObservationClient.getRecentSegments()` now return real data
+  (`activity_snapshot.current_app`, real recent `companion_segments` rows)
+  instead of `{error}`. Stochastic Pulse / Event Opportunity / a future
+  `need_context` round now actually have Tasker + companion signal to work
+  with on the live deployment, not just local state.
+- **Known, unresolved limitation found this pass**: anon key has no
+  `DELETE`/`UPDATE` on `companion_events` — see "Accessibility snapshot
+  privacy rules" above. Three harmless test rows from this session's
+  investigation are stuck in the live table until vv either grants a
+  `DELETE` policy or removes them by hand.
+- Still open, unchanged: no live WeChat test of an actual proactive
+  `send_message` or a real `need_context` round trip on a physical device.
+  Real screenshot + Vision captioning remains a recorded future enhancement,
+  not started.
