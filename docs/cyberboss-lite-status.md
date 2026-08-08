@@ -567,7 +567,7 @@ one more preflight call, at systemd unit start (before the bridge loop begins
 accepting messages) — still not a recurring heartbeat, just one more
 call site of the same synchronous check.
 
-## Session 3 (real host lock, bubble-merge retune, systemd, Pulse) — in progress
+## Session 3 (real host lock, bubble-merge retune, systemd, Pulse) — done
 
 No written spec doc for session 3 exists (unlike session 2's committed
 `docs/session-2-spec.md`) — scope came directly from vv in chat, in two
@@ -577,8 +577,10 @@ bubble-merge retune → systemd → startup ACL preflight → crash/restart
 verification → Pulse + Tasker → flip the flag), then — after Pulse/Tasker
 came back with no real spec anywhere — a follow-up message giving Pulse a
 concrete minimal scope and explicitly deferring Tasker observation to a
-documentation-only note. Everything through Pulse is now done and verified;
-only the final flag flip + live acceptance pass remains (see below).
+documentation-only note. Everything in that list, including the final flag
+flip and live acceptance pass, is done — see "Final live acceptance" and
+"Two real issues found during this final pass" below for what live traffic
+actually surfaced (both fixed, neither was a lock/Pulse defect).
 
 ### Real host lock (spec: Morrow's `docs/agent-runtime-lock.md`)
 
@@ -804,10 +806,123 @@ committed interface:
   session once the Android side's data format is worked out separately. No
   code, no new dependencies, no open port added this session.
 
-### Final live acceptance — see the dedicated section below
+### Final live acceptance — done, against vv's real WeChat account
 
-`CYBERBOSS_ENABLE_SCHEDULED_INTENTIONS` flip and the real end-to-end WeChat
-verification (real reminder send, resolve-without-duplicate, lock-busy skip,
-restart recovery of a still-pending intention) are recorded further down
-once run, per vv's explicit go-ahead requirement for turning on real
-proactive sends to a live account.
+`CYBERBOSS_ENABLE_SCHEDULED_INTENTIONS=true` flipped in `/etc/cyberboss.env`
+per vv's explicit go-ahead in the same message that gave Pulse its scope.
+Sequence actually run (all against the real deployed `cyberboss.service`, not
+a simulation):
+
+1. Created a real `reminder` intention directly via `intentionsStore.create()`
+   (same function real turns use), `dueAt` ~150s out, on the live
+   `/srv/cyberboss-lite/state/intentions.json`.
+2. **Restart recovery while still pending**: `kill -9`'d the live main PID
+   immediately after creation (before `dueAt`), confirmed `systemd`
+   `Restart=always` brought up a fresh PID and the intention was still
+   present, same `id`, still `pending`.
+3. **Real `lock_busy` skip — twice, from genuine contention, not simulated**:
+   once `dueAt` passed, Pulse's tick found it and tried
+   `tryAcquireHostLock`, which correctly reported busy because this very cc
+   session (Morrow) was actively holding `/run/agent-runtime/claude.lock` at
+   the time — logged `{"sent":false,"reason":"lock_busy"}`, intention stayed
+   `pending`, no preemption. This is strictly better evidence than a
+   synthetic busy-lock test would have been.
+4. **Real send, after vv's WeChat message refreshed the token**: see "context_token
+   staleness" below — once vv sent a real WeChat message, the next Pulse tick
+   sent the queued reminder successfully: `{"id":"int_39c4...","sent":true}`.
+5. **Resolve without duplicate**: `intentions.json` confirmed `status:
+   "resolved"` immediately after; grepping the log for
+   `"id":"...","sent":true` for that id returns exactly `1` — structurally
+   guaranteed going forward too, since `selectDueForExecution` only ever
+   considers `status === "pending"` intentions.
+6. Full suite: 135/135 (`npm test`), clean on both the dev tree and
+   `/srv/cyberboss-lite/app` as `cyberboss`.
+
+**Bonus real-traffic confirmation, not explicitly asked for but worth
+recording**: vv's WeChat message arrived >6h after the previous real turn
+(2026-08-06), which correctly triggered episode idle rollover (condition A)
+*before* that turn's model call even ran (`prepareTurn`'s spec §8 ordering).
+The old episode was archived (`episodes/archive/episode_22324946-....json`)
+and a fresh one started — confirmed live, not just in the existing synthetic
+`turn-coordinator.test.js` coverage.
+
+### Two real issues found during this final pass, both fixed
+
+Live traffic surfaced things no unit test had exercised — consistent with
+every prior session's experience in this repo ("A real bug was caught by
+testing, not inspection").
+
+**1. `context_token` staleness blocks real proactive sends after ~44h of
+no inbound traffic — a platform constraint, not a bug, but worth recording.**
+Cyberboss's WeChat send (both normal replies and Pulse's proactive sends)
+requires a `context_token` captured from the *last real inbound message*
+(`src/adapters/channel/weixin/context-token-store.js`). vv's account hadn't
+sent Cyberboss anything since the session-2 real-device verification
+(2026-08-06); by the time Pulse tried to deliver the reminder, the gateway
+rejected it with `sendMessage ret=-2 errcode= errmsg=prepare failed`.
+Checked upstream Cyberboss's original (pre-Lite) proactive-send code
+(`git show 373ab17:src/services/system-message-service.js`) — it used the
+exact same "reuse last known persisted token" approach, with an explicit
+comment: `"Let this user talk to the bot once first"`. This isn't new
+breakage from session 3; it's the first time anything in this codebase has
+actually attempted a truly proactive (non-reply) send, so it's the first
+time this precondition mattered. **Unblocked itself** the moment vv sent a
+real message — no code change needed, just documenting it because it's a
+real operational constraint anyone running scheduled intentions needs to
+know: a reminder can silently fail to deliver if the account has gone quiet
+long enough for the gateway to expire the session, and it'll just keep
+retrying every Pulse tick until either it succeeds or a human notices.
+
+**2. `executeDueIntentions` had no `try/catch` around `sendFn` — a failing
+send aborted the rest of that tick's due-intention loop.** Found because the
+context_token failure above threw all the way up through
+`runDueIntentionsCheck()`, only caught by Pulse's generic outer catch
+(`console.error("pulse tick failed: ...")`) — which meant (a) any *other* due
+intention in the same tick would never even be attempted that cycle, and (b)
+the failure reason for the specific intention that failed was buried in a
+generic log line instead of the structured `executed` array everything else
+uses. Fixed in `src/core/intentions-store.js`: `sendFn` failures are now
+caught per-intention, recorded as `{sent: false, reason: "send_failed",
+error}`, the intention stays `pending` for retry next tick (same posture as
+`lock_busy`), and the loop continues to any other due intentions. Regression
+test added (`test/intentions-store.test.js`): two due intentions, first
+`sendFn` throws, second must still succeed and resolve.
+
+**3. (Related, smaller) `claude exited with code 1` with empty `stderr` was
+undiagnosable.** A real chat turn (responding to vv's actual WeChat message)
+failed this way once during the final pass — reproducing the identical call
+immediately after succeeded cleanly (`"晚上好呀～今天过得怎么样？"`), so this
+looks like a one-off CLI/network blip, not a systemic issue introduced this
+session. But the failure *was* undiagnosable after the fact: `stdout` was
+captured on the thrown `Error` object (for the existing not-logged-in retry
+check) but never actually logged anywhere, and `stderr` was empty this time.
+Fixed in `src/adapters/runtime/claudecode/index.js`:
+`summarizeStdoutForDiagnostics()` adds a bounded summary to the error message
+— if `stdout` parses as the CLI's JSON envelope, only non-content fields
+(`type`/`subtype`/`is_error`/`stop_reason`/`num_turns`/`duration_ms`/
+`total_cost_usd`) are surfaced, **never** `result`/`structured_output` (spec
+§7: "日志不得记录正文" — those two fields are exactly where the model's real
+reply text lives); if `stdout` isn't valid JSON, only a byte length is
+reported, not the raw text. Three new tests assert the redaction directly
+(a synthetic envelope with real-looking Chinese reply text in `result`/
+`structured_output` must never appear in the summary).
+
+### Session 3 close-out
+
+- Full suite: **135/135** (`npm test`, dev tree and `/srv/cyberboss-lite/app`
+  as `cyberboss`).
+- `deploy/cyberboss.service` running live, `enable`d, `Restart=always`,
+  `CYBERBOSS_ENABLE_SCHEDULED_INTENTIONS=true` in `/etc/cyberboss.env`.
+- Deployed copy in sync with `lite` HEAD via the same `rsync --delete
+  --exclude=node_modules --exclude=.git` + `node_modules` rsync pattern used
+  since session 2 (no dependency changes this session).
+- Working tree clean, all commits pushed to `origin/lite`.
+- **Not in this session's scope, confirmed out-of-scope by vv**: Tasker
+  ingestion itself (direction recorded above only), any change to Pulse
+  beyond driving Future Intentions, any autonomous "reach out to chat"
+  behavior.
+- **Known operational note for whoever's on call next**: if scheduled
+  reminders/check-ins stop delivering after a long quiet period, check for
+  the `context_token` staleness pattern above before assuming the lock/Pulse
+  mechanism broke — it's a WeChat-gateway session-window issue, and it
+  self-heals the moment vv sends any real message.

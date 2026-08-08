@@ -232,11 +232,24 @@ async function executeDueIntentions({ store, state, nowMs, enabled, tryLock, sen
       await sendFn(intention);
       executed.push({ id: intention.id, sent: true });
       nextState = store.resolve(nextState, [intention.id], { status: "resolved" }).state;
+    } catch (error) {
+      // A failing send (found live in session 3: a stale/expired WeChat
+      // context_token) must not abort the rest of this tick's due list — the
+      // intention simply stays pending and gets retried next tick, exactly
+      // like lock_busy above. Surfacing the error message here means the
+      // caller's own log line carries the real reason instead of only a
+      // generic outer "pulse tick failed", without ever including message
+      // bodies (spec §7).
+      executed.push({ id: intention.id, sent: false, reason: "send_failed", error: formatError(error) });
     } finally {
       lock.release();
     }
   }
   return { state: nextState, executed };
+}
+
+function formatError(error) {
+  return error instanceof Error ? error.message : String(error || "unknown error");
 }
 
 module.exports = {

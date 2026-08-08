@@ -217,6 +217,38 @@ test("executeDueIntentions skips (does not send) when the fake lock reports busy
   assert.equal(result.state.intentions[0].status, "pending");
 });
 
+test("executeDueIntentions: a failing sendFn (e.g. a stale WeChat context_token, found live in session 3) stays pending for retry and does not abort the rest of the due list", async () => {
+  const store = createIntentionsStore(tempConfig());
+  let state = store.load();
+  ({ state } = store.create(state, {
+    type: "reminder", reason: "喝水", sourceQuote: "喝水", dueAt: "2026-08-06T10:30:00.000Z",
+  }, { nowIso: NOW_ISO }));
+  ({ state } = store.create(state, {
+    type: "reminder", reason: "吃药", sourceQuote: "吃药", dueAt: "2026-08-06T10:31:00.000Z",
+  }, { nowIso: NOW_ISO }));
+
+  const sentIds = [];
+  const result = await executeDueIntentions({
+    store, state, nowMs: Date.parse("2026-08-06T11:00:00.000Z"), enabled: true,
+    tryLock: async () => ({ acquired: true, release: () => {} }),
+    sendFn: async (intention) => {
+      if (intention.reason === "喝水") {
+        throw new Error("sendMessage ret=-2 errcode= errmsg=prepare failed");
+      }
+      sentIds.push(intention.id);
+    },
+  });
+
+  assert.equal(sentIds.length, 1, "第二个 due intention 不应该被第一个的失败拖累，应该照常发送");
+  const [drinkWater, takeMeds] = result.state.intentions;
+  assert.equal(drinkWater.status, "pending", "发送失败的 intention 应该保持 pending，等下一个 tick 重试");
+  assert.equal(takeMeds.status, "resolved");
+  const failedEntry = result.executed.find((e) => e.id === drinkWater.id);
+  assert.equal(failedEntry.sent, false);
+  assert.equal(failedEntry.reason, "send_failed");
+  assert.match(failedEntry.error, /prepare failed/);
+});
+
 test("load fails closed on a corrupt file instead of silently resetting", () => {
   const config = tempConfig();
   fs.writeFileSync(config.intentionsFile, "{broken", "utf8");

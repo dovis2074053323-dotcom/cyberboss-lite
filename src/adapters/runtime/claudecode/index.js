@@ -189,7 +189,14 @@ function runClaudeProcess({ command, args, env, cwd, timeoutMs }) {
         return;
       }
       if (code !== 0) {
-        const error = new Error(`claude exited with code ${code}: ${stderr.slice(0, 500)}`);
+        // Found live in session 3: a bare `claude exited with code 1` with
+        // empty stderr is genuinely undiagnosable after the fact — stdout was
+        // captured on the error object (for the not-logged-in retry check)
+        // but never actually logged anywhere. Fixed by including a summary
+        // in the message itself, deliberately excluding `result`/
+        // `structured_output` (spec §7: never log message bodies) — only
+        // envelope-level fields that can't contain conversation content.
+        const error = new Error(`claude exited with code ${code}: ${stderr.slice(0, 500)}${summarizeStdoutForDiagnostics(stdout)}`);
         error.stdout = stdout;
         reject(error);
         return;
@@ -228,6 +235,32 @@ function parseResult(raw) {
   };
 }
 
+// Diagnostic-only summary of a failed process's stdout — deliberately never
+// includes `result`/`structured_output` (the model's actual reply, spec §7:
+// "日志不得记录正文"). If stdout parses as the CLI's own JSON envelope, only
+// envelope-level fields that can't carry conversation content are surfaced;
+// if it doesn't parse, only a byte length is reported (raw text could still
+// be conversation content mid-stream, not just a CLI warning).
+function summarizeStdoutForDiagnostics(stdout) {
+  const text = String(stdout || "");
+  if (!text) {
+    return " [stdout: empty]";
+  }
+  try {
+    const parsed = JSON.parse(text);
+    const safeKeys = ["type", "subtype", "is_error", "stop_reason", "num_turns", "duration_ms", "total_cost_usd"];
+    const safeFields = {};
+    for (const key of safeKeys) {
+      if (parsed && Object.prototype.hasOwnProperty.call(parsed, key)) {
+        safeFields[key] = parsed[key];
+      }
+    }
+    return ` [stdout parsed, envelope fields: ${JSON.stringify(safeFields)}]`;
+  } catch {
+    return ` [stdout: ${Buffer.byteLength(text, "utf8")} bytes, not valid JSON]`;
+  }
+}
+
 function loadSystemPrompt(config) {
   try {
     const template = fs.readFileSync(config.systemPromptFile, "utf8");
@@ -241,4 +274,4 @@ function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-module.exports = { createClaudeCodeRuntimeAdapter, buildArgs, parseResult, RESULT_SCHEMA_JSON, runAclPreflightOrThrow };
+module.exports = { createClaudeCodeRuntimeAdapter, buildArgs, parseResult, RESULT_SCHEMA_JSON, runAclPreflightOrThrow, summarizeStdoutForDiagnostics };
