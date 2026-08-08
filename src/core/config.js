@@ -74,6 +74,29 @@ function readConfig() {
     // is a no-op (zero lock attempts, zero sends) when nothing is due.
     // Overridable only so tests don't have to wait 60 real seconds per tick.
     pulseIntervalMs: readIntEnv("CYBERBOSS_PULSE_INTERVAL_MS") || 60_000,
+
+    // Observation sources (this session's Cyberboss Proactive + keke-overflow
+    // Companion rework): Tasker's Supabase project (health_snapshot/
+    // activity_snapshot, the documented Snapshot layer — not agent_dashboard's
+    // text summary) and keke-overflow's own project (structured
+    // companion_segments read, keke_state expression write — Cyberboss is now
+    // the only writer of keke_state since jiwen/sentinel were retired).
+    // No defaults baked in on purpose (same posture as sharedCredentialsFile
+    // above) — these are read-scoped anon keys, not secrets on the level of
+    // the WeChat/Claude credentials, but still don't belong hardcoded in a repo.
+    taskerSupabaseUrl: readTextEnv("CYBERBOSS_TASKER_SUPABASE_URL"),
+    taskerSupabaseAnonKey: readTextEnv("CYBERBOSS_TASKER_SUPABASE_ANON_KEY"),
+    companionSupabaseUrl: readTextEnv("CYBERBOSS_COMPANION_SUPABASE_URL"),
+    companionSupabaseAnonKey: readTextEnv("CYBERBOSS_COMPANION_SUPABASE_ANON_KEY"),
+
+    // Stochastic Pulse (upstream WenXiaoWendy/cyberboss's
+    // system-checkin-poller.js, ported this session): random-interval wake-up
+    // that only enqueues an observation bundle, never decides content itself —
+    // see docs/cyberboss-lite-status.md session 4 notes once written.
+    checkinConfigFile: path.join(stateDir, "checkin-config.json"),
+    systemMessageQueueFile: path.join(stateDir, "system-message-queue.json"),
+    checkinMinIntervalMs: readIntEnv("CYBERBOSS_CHECKIN_MIN_INTERVAL_MS") || 3 * 60_000,
+    checkinMaxIntervalMs: readIntEnv("CYBERBOSS_CHECKIN_MAX_INTERVAL_MS") || 60 * 60_000,
   };
 }
 
