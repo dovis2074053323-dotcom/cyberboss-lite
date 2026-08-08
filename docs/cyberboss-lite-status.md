@@ -1032,13 +1032,34 @@ tmpfiles — `flock` itself never `mkdir`s its lock file's parent) — no prior
 test had exercised a real lock acquisition through `app.js`'s own methods
 end-to-end, so this had gone uncaught since session 3.
 
-**Not done this session, deployment-side**: `/etc/cyberboss.env` still
-doesn't have the four observation env vars, and `cyberboss.service` hasn't
-been restarted to pick up this session's code — Stochastic Pulse and Event
-Opportunity are wired but inert on the live deployment until both happen.
-No live WeChat test of a real proactive send this session (session 3's real
-`context_token`/lock-busy verification was for scheduled *intentions*, not
-this new proactive-turn path — that's still open).
+**Deployed and live** (end of this session): `/home/keke/cyberboss-lite/app`
+HEAD `b0efbdb` mirrored to `/srv/cyberboss-lite/app` via the same
+`rsync -a --delete --exclude=node_modules --exclude=.git` + chown-to-`cyberboss`
+pattern (no `package.json` changes this session, no `npm install` needed).
+`npm run check` clean and `npm test` (230/231, 1 skipped — same real-path
+try-lock test session 3 already documented as skipping without passwordless
+sudo as `cyberboss`) both re-run clean on the deployed copy before restarting
+anything. `systemctl restart cyberboss.service` — confirmed `active (running)`,
+`NRestarts=0`, log shows a clean boot sequence ending in Stochastic Pulse's
+own "next stochastic checkin in 45m" line (`system-checkin-poller.js`'s
+`scheduleNext` log), no new errors in `state/cyberboss.log` since the restart.
+
+**`/etc/cyberboss.env` still doesn't have the four observation env vars**
+(`CYBERBOSS_TASKER_SUPABASE_URL`/`ANON_KEY`, `CYBERBOSS_COMPANION_SUPABASE_URL`/
+`ANON_KEY`) — confirmed by reading the file directly this session. Practical
+effect on the live process: Stochastic Pulse and Event Opportunity both run on
+schedule and enqueue real bundles, Intentions Tick still drains them every
+60s, but every bundle's `taskerSnapshot`/`companionSegments` fields come back
+as `{error: "...not configured..."}` (the stub adapters from task #14) —
+proactive turns only ever see local data (current state / open loops / core
+memory) until those four vars are set. `need_context`'s round-2 fetch would
+fail the same way, but still runs a real round 2 — the prompt just renders
+`Refreshed Accessibility context: (unavailable — ...)` instead of real rows,
+and the model decides with that acknowledgment (proactive-turn-builder.js's
+error-tolerant rendering, same posture as the rest of the bundle). Setting
+the four vars and restarting is enough to light up the remote half; no code
+change needed. No live WeChat test of a real proactive send this session —
+that's still open, same as before.
 
 ### Task #12 — need_context two-round relay: built
 
@@ -1088,3 +1109,23 @@ dropped from the menu), `test/proactive-turn-runner.test.js` (real two-round
 flow, fetch-failure resilience, two-round cap), `test/app-proactive-drain.test.js`
 (end-to-end wiring through `app.js`), `test/proactive-result-schema.test.js`
 (renamed enum value).
+
+### Session 4 close-out
+
+- Full suite: **231/231** (`npm test`, dev tree), **230/231 + 1 skipped**
+  (deployed copy as `cyberboss` — same real-path try-lock skip session 3
+  documented). `npm run check` clean on both.
+- `cyberboss-lite` commit `b0efbdb` on `lite`, pushed to `origin/lite`.
+- `keke-overflow` commits `fbf304c` (unrelated pre-existing doc edit from
+  before this session, committed on its own so it doesn't get attributed to
+  this session's work) and `d8f4f8c` (this session's actual `CLAUDE.md`/
+  `cc-clawd-overhaul.md` updates), both pushed to `origin/main`.
+- Deployed to `/srv/cyberboss-lite/app`, `cyberboss.service` restarted,
+  confirmed healthy (see "Deployed and live" above).
+- **Not done this session**: the four observation env vars still aren't set
+  in `/etc/cyberboss.env` (a deliberate no-touch — setting real Supabase
+  credentials wasn't part of this session's scope), so Stochastic Pulse/
+  Event Opportunity/`need_context` all run for real but only ever see local
+  data on the live deployment right now. No live WeChat test of an actual
+  proactive send. Real screenshot + Vision captioning stays a recorded
+  future enhancement (task #12's resolution), not started.
