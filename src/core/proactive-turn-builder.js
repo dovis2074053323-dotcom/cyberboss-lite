@@ -2,15 +2,24 @@
 // from an observation bundle assembled by observation-bundle.js. Shape
 // mirrors upstream WenXiaoWendy/cyberboss's system-message-dispatcher.js
 // buildSystemInboundText, adapted to this session's narrow contract
-// (proactive-result-schema.js: send_message/silent/need_vision/defer)
+// (proactive-result-schema.js: send_message/silent/need_context/defer)
 // instead of upstream's free-form {"action":"silent"|"send_message"} JSON.
 //
-// Wiring this into an actual runtime-adapter call — and applying whatever
-// decision comes back (WeChat send, keke_state push, or session 4's Vision
-// relay for need_vision) — is task #14/#12, not this file. This module only
-// produces text.
+// Two-round relay (task #12, this session): round 1 gets `refreshedContext`
+// undefined and may answer `need_context`; round 2 (proactive-turn-runner.js,
+// after fetching a fresher on-demand Accessibility read) passes
+// `refreshedContext` and the prompt drops `need_context` from the menu
+// entirely — this is a hard cap at two rounds, not a suggestion left to the
+// model's judgment, so a model that keeps asking can't turn one wake-up into
+// an unbounded chain of Claude calls. `refreshedContext` is raw
+// `companion_events` rows (package/activity/title/sanitized-url), never an
+// image — task #12 deliberately chose "refresh the existing text signal on
+// demand" over building real screenshot transport (see
+// proactive-result-schema.js's `need_context` comment for the full rationale).
 
-function buildProactiveTurnPrompt(bundle) {
+function buildProactiveTurnPrompt(bundle, { refreshedContext } = {}) {
+  const isRound2 = refreshedContext !== undefined;
+
   const sections = [
     "SYSTEM ACTION MODE: internal proactive check, not user chat.",
     "You are deciding whether this moment is worth reaching out about — not replying to an incoming message.",
@@ -22,17 +31,38 @@ function buildProactiveTurnPrompt(bundle) {
     formatValueSection("Tasker snapshot (health/activity)", bundle?.taskerSnapshot),
     formatSegmentsSection(bundle?.companionSegments),
     "",
-    "Decide exactly one of:",
-    "  send_message — write the message yourself, natural and short.",
-    "  silent — you looked, decided not to reach out this time.",
-    "  need_vision — text isn't enough, you want to see the screen first.",
-    "  defer — not enough signal either way yet, check again later.",
-    "Return exactly one JSON object after any consideration. No markdown fences, no text outside it:",
-    '{"action":"send_message","message":"<short natural message>","reason":"<why, internal only>"}',
-    '{"action":"silent","message":null,"reason":"<why, internal only>"}',
-    '{"action":"need_vision","message":null,"reason":"<why, internal only>"}',
-    '{"action":"defer","message":null,"reason":"<why, internal only>"}',
   ];
+
+  if (isRound2) {
+    sections.push(
+      "This is round 2: you already asked for fresher context (need_context) on your first look. Here it is:",
+      formatRefreshedContextSection(refreshedContext),
+      "",
+      "Decide now, exactly one of:",
+      "  send_message — write the message yourself, natural and short.",
+      "  silent — you looked, decided not to reach out this time.",
+      "  defer — not enough signal either way yet, check again later.",
+      "need_context is not available this round — you already used it once for this wake-up; decide with what you have.",
+      "Return exactly one JSON object after any consideration. No markdown fences, no text outside it:",
+      '{"action":"send_message","message":"<short natural message>","reason":"<why, internal only>"}',
+      '{"action":"silent","message":null,"reason":"<why, internal only>"}',
+      '{"action":"defer","message":null,"reason":"<why, internal only>"}',
+    );
+  } else {
+    sections.push(
+      "Decide exactly one of:",
+      "  send_message — write the message yourself, natural and short.",
+      "  silent — you looked, decided not to reach out this time.",
+      "  need_context — the observation above isn't enough; ask for a fresher, fuller on-demand read of what's currently on screen (package/activity/title/URL — text only, never an image) before deciding.",
+      "  defer — not enough signal either way yet, check again later.",
+      "Return exactly one JSON object after any consideration. No markdown fences, no text outside it:",
+      '{"action":"send_message","message":"<short natural message>","reason":"<why, internal only>"}',
+      '{"action":"silent","message":null,"reason":"<why, internal only>"}',
+      '{"action":"need_context","message":null,"reason":"<why, internal only>"}',
+      '{"action":"defer","message":null,"reason":"<why, internal only>"}',
+    );
+  }
+
   return sections.filter((line) => line !== "").join("\n");
 }
 
@@ -65,6 +95,22 @@ function formatSegmentsSection(segments) {
     + `contexts=${JSON.stringify(seg.contexts || [])} interaction=${JSON.stringify(seg.interaction || {})}`
   ));
   return `Recent companion segments:\n${lines.join("\n")}`;
+}
+
+// Raw companion_events rows (event=screen_context), not the hourly-aggregated
+// companion_segments — this is what "fresher, fuller" actually means: the
+// same package/activity/title/sanitized-url fields KekeAccessibilityService
+// already collects (commit b0f7483), just read on demand and unsmoothed by
+// the aggregator's cooldown/dedupe, instead of a new capture on the device.
+function formatRefreshedContextSection(refreshedContext) {
+  if (!refreshedContext || refreshedContext.error) {
+    return `Refreshed Accessibility context: (unavailable${refreshedContext?.error ? ` — ${refreshedContext.error}` : ""})`;
+  }
+  if (!Array.isArray(refreshedContext) || refreshedContext.length === 0) {
+    return "Refreshed Accessibility context: (none)";
+  }
+  const lines = refreshedContext.map((row) => `- ${row.created_at}: ${JSON.stringify(row.detail || {})}`);
+  return `Refreshed Accessibility context:\n${lines.join("\n")}`;
 }
 
 module.exports = { buildProactiveTurnPrompt };

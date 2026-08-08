@@ -8,11 +8,11 @@ const crypto = require("crypto");
 // fixed string with a real observation bundle (memory/context/Tasker
 // snapshot/companion segments/open loops — see observation-bundle.js): this
 // file still makes zero Claude calls, exactly like upstream and exactly like
-// Lite's existing session-3 Pulse. The decision (send/silent/need_vision/
+// Lite's existing session-3 Pulse. The decision (send/silent/need_context/
 // defer) happens downstream against proactive-result-schema.js's narrow
-// contract — wiring the queue drain into an actual Claude turn is task #14
-// (app.js scheduler wiring) and task #12 (Vision relay for need_vision),
-// both deferred to next session. This file only schedules and enqueues.
+// contract — wiring the queue drain into an actual Claude turn (task #14)
+// and the need_context two-round relay (task #12) are both built, in
+// app.js/proactive-turn-runner.js. This file only schedules and enqueues.
 //
 // Distinct from Lite's existing session-3 Pulse (app.js startPulse/
 // runPulseTick): that one is a fixed 60s tick that only drives already-created

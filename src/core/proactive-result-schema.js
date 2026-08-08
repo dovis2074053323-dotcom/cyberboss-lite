@@ -15,14 +15,21 @@
 //     the model in this same call, not looked up from a table.
 //   - silent: a real decision — evaluated the observation, decided not to
 //     reach out this time.
-//   - need_vision: text-only signal isn't enough; ask for a screenshot before
-//     deciding (session 4's Vision two-turn relay, not built this session —
-//     this schema just defines the shape it will consume).
+//   - need_context: the observation bundle isn't enough to decide; ask for a
+//     fresher, fuller on-demand Accessibility read before deciding (session 4's
+//     two-turn relay — see proactive-turn-runner.js's round-2 handling). This
+//     is deliberately NOT a screenshot/Vision request: task #12 (this
+//     session) chose "refresh the existing text-only Accessibility signal on
+//     demand" over building real screenshot capture/upload infrastructure —
+//     keke-overflow's cc-clawd-overhaul.md 阶段三 privacy stance ("不存截图
+//     原图") stays intact. Real screenshot + Vision captioning is recorded as
+//     a future enhancement, to revisit once this text-only relay has real
+//     usage to learn from.
 //   - defer: not enough signal to decide either way right now, try again
 ///    later. Distinct from `silent` (silent = decided against it; defer =
 //     didn't decide).
 
-const ACTIONS = ["send_message", "silent", "need_vision", "defer"];
+const ACTIONS = ["send_message", "silent", "need_context", "defer"];
 
 const LIMITS = {
   messageMaxChars: 600,

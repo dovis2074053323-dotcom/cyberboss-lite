@@ -112,6 +112,29 @@ test("companion-observation.getRecentSegments returns rows with native jsonb (no
   }
 });
 
+test("companion-observation.getLatestScreenContext reads raw companion_events, not companion_segments", async () => {
+  const stub = stubFetch((url) => {
+    assert.match(url, /companion_events/);
+    assert.match(url, /event=eq\.screen_context/);
+    assert.match(url, /order=created_at\.desc/);
+    assert.match(url, /limit=5/);
+    return jsonResponse([
+      { detail: { package: "com.tencent.mm", activity: "ChattingUI" }, created_at: "2026-08-09T12:00:00Z" },
+    ]);
+  });
+  try {
+    const client = createCompanionObservationClient({
+      companionSupabaseUrl: "https://companion.supabase.co",
+      companionSupabaseAnonKey: "k",
+    });
+    const rows = await client.getLatestScreenContext();
+    assert.equal(rows.length, 1);
+    assert.deepEqual(rows[0].detail, { package: "com.tencent.mm", activity: "ChattingUI" });
+  } finally {
+    stub.restore();
+  }
+});
+
 test("pet-state.pushExpression PATCHes only the real keke_state columns provided", async () => {
   const stub = stubFetch((url, init) => {
     assert.match(url, /keke_state\?id=eq\.1$/);

@@ -7,6 +7,11 @@ const path = require("path");
 
 const { CyberbossApp } = require("../../src/core/app");
 
+function mkdirReturn(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
 function tempConfig(overrides = {}) {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-app-test-"));
   return {
@@ -38,12 +43,34 @@ function tempConfig(overrides = {}) {
     episodeCurrentFile: path.join(stateDir, "episodes", "current.json"),
     episodeArchiveDir: path.join(stateDir, "episodes", "archive"),
     enableScheduledIntentions: false,
-    hostLockDir: path.join(stateDir, "agent-runtime"),
+    // Real deployments rely on /run/agent-runtime already existing (systemd
+    // tmpfiles, not created by this code) — flock itself never mkdir's the
+    // lock file's parent, so the tmp fixture has to do it explicitly instead.
+    hostLockDir: mkdirReturn(path.join(stateDir, "agent-runtime")),
     hostLockWaitMs: 1_000,
     // Fast timings for tests — production defaults are 1800/3500/60000.
     inboundIdleDelayMs: 60,
     inboundMaxWaitMs: 150,
     pulseIntervalMs: 40,
+    // Session 4 additions: Stochastic Pulse / Event Opportunity queue+state
+    // files under the same tmp stateDir, and deliberately unset observation
+    // credentials — buildApp() exercises the same "not configured yet" path
+    // production is actually in right now (see createTaskerSnapshotClientOrStub
+    // et al. in app.js). Interval/cooldown values are fast-but-inert: nothing
+    // in these tests calls poller.start(), so they only matter if a test
+    // opts in explicitly via overrides.
+    taskerSupabaseUrl: "",
+    taskerSupabaseAnonKey: "",
+    companionSupabaseUrl: "",
+    companionSupabaseAnonKey: "",
+    checkinConfigFile: path.join(stateDir, "checkin-config.json"),
+    systemMessageQueueFile: path.join(stateDir, "system-message-queue.json"),
+    checkinMinIntervalMs: 20,
+    checkinMaxIntervalMs: 20,
+    eventOpportunityStateFile: path.join(stateDir, "event-opportunity-state.json"),
+    eventOpportunityIntervalMs: 20,
+    eventOpportunityCooldownMs: 20,
+    eventOpportunityLongSilenceMs: 6 * 60 * 60_000,
     ...overrides,
   };
 }

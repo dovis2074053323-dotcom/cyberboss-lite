@@ -926,3 +926,165 @@ reported, not the raw text. Three new tests assert the redaction directly
   the `context_token` staleness pattern above before assuming the lock/Pulse
   mechanism broke — it's a WeChat-gateway session-window issue, and it
   self-heals the moment vv sends any real message.
+
+## Session 4 (Cyberboss Proactive + keke-overflow Companion rework)
+
+Cross-repo effort: this doc covers the `cyberboss-lite` half; the `keke-overflow`
+half (Accessibility raw-context rework, `keke-sentinel.py`/`keke-jiwen.py`
+retirement) is recorded in `keke-overflow/CLAUDE.md`'s 数据流 section and
+`keke-overflow/cc-clawd-overhaul.md`'s superseded-阶段二 note. Task numbering
+(#9-15) is from vv's in-chat plan, not a committed spec doc — same posture as
+session 3's Pulse spec.
+
+### Tasks #9-11 — observation adapters, narrow proactive contract, Stochastic Pulse skeleton
+
+Committed as `c783c88` (see that commit's message and each new file's header
+comment for the full rationale — not repeated here). Summary: three Supabase
+observation adapters (`src/adapters/observation/*` — Tasker snapshot read,
+companion segments read, `keke_state` expression write), `proactive-result-schema.js`
+(the narrow `send_message`/`silent`/`need_context`/`defer` contract, structurally
+unable to touch memory/loops/intentions), and the Stochastic Pulse skeleton
+(`system-checkin-poller.js`, ported from upstream — random interval, enqueues
+an observation bundle, never calls Claude itself). `app.js` was untouched by
+that commit on purpose; wiring was deferred to this session.
+
+### Task #13 — Event Opportunity poller
+
+Fixed low-frequency poll (`config.eventOpportunityIntervalMs`, default 5min —
+unlike Stochastic Pulse's random 3-60min range). New files:
+`src/core/event-opportunity-detector.js` (pure delta comparison — new
+companion-segment context / open-loop change / Tasker environment change /
+long-silence edge-trigger) and `src/core/event-opportunity-state-store.js`
+(persists what was last observed, across restarts), plus
+`src/app/event-opportunity-poller.js` tying them to the shared
+`system-message-queue-store` (source: `"event_opportunity"`, alongside
+Stochastic Pulse's `"stochastic_pulse"`). Deliberately no Supabase Realtime
+(vv's call, this session) — poll-and-diff only.
+
+Two anti-spam mechanisms, doing different jobs: **dedupe** (the detector only
+ever compares against the last *observed* snapshot, so a value that changes
+once and then holds steady never re-fires — this is what stops "long silence"
+from firing every single tick forever once the threshold is first crossed)
+and **cooldown** (a blanket minimum gap between any two firings, a safety net
+independent of which signal fired).
+
+### Task #14 — app.js wiring: real proactive turns
+
+The existing 60s Intentions Tick (`runPulseTick`, session 3) now does two
+independent things under the same `pulseTickInFlight` reentrancy guard:
+`runDueIntentionsCheck()` (unchanged) and the new `runProactiveDrainTick()`.
+Deliberately one shared timer, not a fourth one — both already needed the
+identical "never overlap with yourself, never preempt Morrow" posture, so a
+separate timer would have bought nothing.
+
+`runProactiveDrainTick()`: non-blocking `tryAcquireHostLock` (busy → skip,
+message stays queued for next tick, exactly like scheduled intentions). Skips
+before even touching the lock if the queue is empty or there's no
+`allowedSenderId` yet (a proactive turn that can only end in `silent` isn't
+worth a Claude call). On acquiring the lock, drains the queue and runs each
+message through `src/core/proactive-turn-runner.js`'s `processProactiveMessage`
+— a pure function (mirrors `intentions-store.js`'s `executeDueIntentions`
+shape) that renders the prompt (`proactive-turn-builder.js`), calls the
+runtime with `PROACTIVE_RESULT_JSON_SCHEMA` instead of the normal-turn schema
+(`runtimeAdapter.sendSingleTurn` gained an optional `resultSchema` override
+for this), validates via `evaluateProactiveResult`, and applies exactly one
+side effect per action:
+
+- `send_message`: WeChat send (`channelAdapter.sendText`, reusing the same
+  persisted-`context_token` resolution real replies use), and only on a
+  confirmed send: `currentStateStore.lastAgentMessageAt` updated (system-owned
+  event timestamp, same bookkeeping category as a normal turn's — episode/
+  memory/loops are untouched, the narrow contract structurally can't reach
+  them) and a `keke_state` push (`expression: "alert"`, `bubbleText`: the
+  message truncated to 40 chars — pet.html's bubble is a small popup, not
+  the real message; the real text only ever goes out over WeChat).
+- `silent` / `defer`: no side effect — see `proactive-result-schema.js`'s
+  module comment for why these are different (`silent` = decided against it;
+  `defer` = didn't decide).
+- `need_context`: not a side effect itself — triggers task #12's round-2 relay
+  (fetch a fresher Accessibility read, ask again), see below. Only the
+  round-2 outcome (`send_message`/`silent`/`defer`) ever reaches this list.
+- Runtime throwing, or the CLI returning something `evaluateProactiveResult`
+  rejects: both fall back to `silent` rather than crashing the drain tick or
+  forwarding a possibly-malformed message.
+
+Observation credentials (`CYBERBOSS_TASKER_SUPABASE_*`/
+`CYBERBOSS_COMPANION_SUPABASE_*`) are **still not set** in `/etc/cyberboss.env`
+— task #9-11 added the adapters, not the real keys. `createSupabaseRestClient`
+throws synchronously if `baseUrl`/`anonKey` are missing, so `app.js` wraps each
+observation adapter construction in a stub that throws a clear
+"not configured" error per-call instead of at boot — `observation-bundle.js`
+already treats a rejected source as `{error}` rather than failing the whole
+bundle, so this degrades to a local-only bundle (current state / open loops /
+core memory, no Tasker/companion data) instead of refusing to start. Setting
+the four env vars and restarting is enough to light up the remote half; no
+code change needed.
+
+135/135 → **224/224** (`npm test`), `npm run check` clean. New test files:
+`test/event-opportunity-detector.test.js`, `test/event-opportunity-state-store.test.js`,
+`test/event-opportunity-poller.test.js`, `test/proactive-turn-runner.test.js`,
+`test/app-proactive-drain.test.js`; one addition to `test/claudecode-runtime.test.js`
+(`resultSchema` override). Found and fixed one test-fixture gap while writing
+`test/app-proactive-drain.test.js`: `test/helpers/app-test-config.js`'s
+`hostLockDir` pointed at a tmp path that was never actually created (real
+deployments rely on `/run/agent-runtime` already existing via systemd
+tmpfiles — `flock` itself never `mkdir`s its lock file's parent) — no prior
+test had exercised a real lock acquisition through `app.js`'s own methods
+end-to-end, so this had gone uncaught since session 3.
+
+**Not done this session, deployment-side**: `/etc/cyberboss.env` still
+doesn't have the four observation env vars, and `cyberboss.service` hasn't
+been restarted to pick up this session's code — Stochastic Pulse and Event
+Opportunity are wired but inert on the live deployment until both happen.
+No live WeChat test of a real proactive send this session (session 3's real
+`context_token`/lock-busy verification was for scheduled *intentions*, not
+this new proactive-turn path — that's still open).
+
+### Task #12 — need_context two-round relay: built
+
+vv's call on the open question flagged earlier this session: `need_context`
+(renamed from the earlier working name `need_vision` — the name itself was
+implying more than what got built) means a fresher, fuller **on-demand
+Accessibility text read**, not a screenshot. Real screenshot capture/upload +
+Vision captioning stays out of scope — recorded as a future enhancement to
+revisit once this text-only relay has real usage to learn from, not built
+this session. `keke-overflow/cc-clawd-overhaul.md` 阶段三's "不存截图原图"
+privacy stance stays fully intact; no on-device capture/upload code, no new
+Supabase table or bucket, no new transport of any kind.
+
+Mechanics: `companion-observation.js` gained `getLatestScreenContext()` — a
+small (default limit 5), on-demand read of raw `companion_events` rows
+(`event=screen_context`, ordered newest-first), deliberately separate from
+`getRecentSegments()` (which stays on the hourly-aggregated
+`companion_segments` for the standard bundle — pulling raw `companion_events`
+on every wake-up would blow the token budget the module's original header
+comment already warned about; this is a small, rare, explicitly-requested
+exception). Same `package`/`activity`/truncated-`title`/sanitized-`url`
+fields `KekeAccessibilityService` already writes (commit `b0f7483`), just
+read unsmoothed and on demand instead of through the hourly cron.
+
+`proactive-turn-builder.js`'s `buildProactiveTurnPrompt(bundle, { refreshedContext })`
+renders two different prompts: round 1 (no second arg) offers `need_context`
+as an option; round 2 (`refreshedContext` given — either the fetched rows or
+an `{error}` marker) drops `need_context` from the menu entirely and shows
+the refreshed rows instead. `proactive-turn-runner.js`'s
+`processProactiveMessage` orchestrates both rounds and hard-caps at two: if
+round 1 answers `need_context`, it fetches via the new adapter (a fetch
+failure degrades to an `{error}` marker in the round-2 prompt, doesn't
+abort), builds the round-2 prompt, and runs one more `callRuntime`. If round
+2 *also* answers `need_context` (a contract violation — the prompt already
+stopped offering it), that's treated the same as any other invalid result:
+falls back to `silent` rather than a third round. `app.js` wires
+`fetchRefreshedContext` to `this.companionObservationClient.getLatestScreenContext()`.
+
+Two full rounds of `callRuntime`/`claude -p` happen only on the `need_context`
+path — every other action (`send_message`/`silent`/`defer` on round 1) is
+still exactly one Claude call, unchanged from task #14.
+
+224/224 → **231/231** (`npm test`), `npm run check` clean. New/changed tests:
+`test/observation-adapters.test.js` (`getLatestScreenContext`),
+`test/proactive-turn-builder.test.js` (round-2 prompt shape, `need_context`
+dropped from the menu), `test/proactive-turn-runner.test.js` (real two-round
+flow, fetch-failure resilience, two-round cap), `test/app-proactive-drain.test.js`
+(end-to-end wiring through `app.js`), `test/proactive-result-schema.test.js`
+(renamed enum value).

@@ -97,6 +97,18 @@ function readConfig() {
     systemMessageQueueFile: path.join(stateDir, "system-message-queue.json"),
     checkinMinIntervalMs: readIntEnv("CYBERBOSS_CHECKIN_MIN_INTERVAL_MS") || 3 * 60_000,
     checkinMaxIntervalMs: readIntEnv("CYBERBOSS_CHECKIN_MAX_INTERVAL_MS") || 60 * 60_000,
+
+    // Event Opportunity (task #13): fixed low-frequency poll (unlike Stochastic
+    // Pulse's random interval) that only queues a wake-up when the bundle
+    // actually changed since last observed — see event-opportunity-detector.js.
+    // longSilenceMs defaults to the same 6h episode-store.js already uses for
+    // idle rollover (IDLE_ROLLOVER_MS) — not imported from there on purpose,
+    // these are two independent concerns that happen to agree on "6h of no
+    // inbound message is the point where something has meaningfully lapsed."
+    eventOpportunityStateFile: path.join(stateDir, "event-opportunity-state.json"),
+    eventOpportunityIntervalMs: readIntEnv("CYBERBOSS_EVENT_OPPORTUNITY_INTERVAL_MS") || 5 * 60_000,
+    eventOpportunityCooldownMs: readIntEnv("CYBERBOSS_EVENT_OPPORTUNITY_COOLDOWN_MS") || 5 * 60_000,
+    eventOpportunityLongSilenceMs: readIntEnv("CYBERBOSS_EVENT_OPPORTUNITY_LONG_SILENCE_MS") || 6 * 60 * 60_000,
   };
 }
 

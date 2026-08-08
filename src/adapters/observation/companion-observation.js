@@ -29,7 +29,28 @@ function createCompanionObservationClient(config) {
     return Array.isArray(rows) ? rows : [];
   }
 
-  return { getRecentSegments };
+  // Task #12's need_context round 2 only — NOT part of the standard
+  // observation bundle (that stays on companion_segments per the header
+  // comment above; every-tap-volume companion_events would blow the token
+  // budget if pulled on every wake-up). This one is deliberately raw and
+  // small (default limit 5), fired at most once per proactive turn, only
+  // when the model explicitly asked for fresher context than the aggregated
+  // segments gave it — same package/activity/title/sanitized-url fields
+  // KekeAccessibilityService writes (commit b0f7483), just unsmoothed by the
+  // aggregator's cooldown/dedupe and read on demand instead of on an hourly
+  // cron. Never reads or requests image data — there is none to read.
+  async function getLatestScreenContext({ limit = 5 } = {}) {
+    const parts = [
+      "select=detail,created_at",
+      "event=eq.screen_context",
+      "order=created_at.desc",
+      `limit=${limit}`,
+    ];
+    const rows = await client.select("companion_events", parts.join("&"));
+    return Array.isArray(rows) ? rows : [];
+  }
+
+  return { getRecentSegments, getLatestScreenContext };
 }
 
 module.exports = { createCompanionObservationClient };

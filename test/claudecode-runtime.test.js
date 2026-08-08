@@ -10,6 +10,14 @@ test("buildArgs always passes --json-schema with the result schema", () => {
   assert.equal(args[flagIndex + 1], RESULT_SCHEMA_JSON);
 });
 
+test("buildArgs uses resultSchema override instead of the normal-turn schema when given (task #14 proactive turns)", () => {
+  const narrowSchema = { type: "object", properties: { action: { type: "string" } } };
+  const args = buildArgs({ text: "hello", config: {}, systemPrompt: "sys", resultSchema: narrowSchema });
+  const flagIndex = args.indexOf("--json-schema");
+  assert.equal(args[flagIndex + 1], JSON.stringify(narrowSchema));
+  assert.notEqual(args[flagIndex + 1], RESULT_SCHEMA_JSON);
+});
+
 test("buildArgs keeps the single-shot, no-tools, no-persistence flags", () => {
   const args = buildArgs({ text: "hello", config: {}, systemPrompt: "" });
   assert.ok(args.includes("--tools"));

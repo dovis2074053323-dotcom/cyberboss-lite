@@ -14,6 +14,17 @@ const { createTurnCoordinator } = require("./turn-coordinator");
 const { StateCorruptionError } = require("./json-store");
 const { acquireHostLock, tryAcquireHostLock, HostLockBusyError, HostLockSystemError } = require("./host-lock");
 const { runAclPreflightOrThrow } = require("../adapters/runtime/claudecode");
+const { createTaskerSnapshotClient } = require("../adapters/observation/tasker-snapshot");
+const { createCompanionObservationClient } = require("../adapters/observation/companion-observation");
+const { createPetStateClient } = require("../adapters/observation/pet-state");
+const { createObservationBundleBuilder } = require("./observation-bundle");
+const { createSystemMessageQueueStore } = require("./system-message-queue-store");
+const { createCheckinConfigStore } = require("./checkin-config-store");
+const { createSystemCheckinPoller } = require("../app/system-checkin-poller");
+const { createEventOpportunityStateStore } = require("./event-opportunity-state-store");
+const { createEventOpportunityPoller } = require("../app/event-opportunity-poller");
+const { PROACTIVE_RESULT_JSON_SCHEMA } = require("./proactive-result-schema");
+const { processProactiveMessage } = require("./proactive-turn-runner");
 
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
 const RETRY_DELAY_MS = 2_000;
@@ -48,9 +59,52 @@ class CyberbossApp {
     this.idleTimer = null;
     this.maxWaitTimer = null;
     // Pulse (session 3): drives Future Intentions only, no autonomous
-    // "reach out to chat" heartbeat. See startPulse/runPulseTick.
+    // "reach out to chat" heartbeat. Session 4 extends the same 60s tick to
+    // also drain the proactive queue (runProactiveDrainTick) under the same
+    // pulseTickInFlight reentrancy guard — see startPulse/runPulseTick below.
     this.pulseTimer = null;
     this.pulseTickInFlight = false;
+
+    // Session 4 (Cyberboss Proactive + keke-overflow Companion rework, task
+    // #14): observation sources are optional at boot — CYBERBOSS_TASKER_*/
+    // CYBERBOSS_COMPANION_* aren't set in production yet (task #9-11 added
+    // the adapters, didn't wire real credentials in). A stub that rejects
+    // with a clear "not configured" error keeps the process bootable either
+    // way; observation-bundle.js already treats a rejected source as
+    // `{error}` rather than failing the whole bundle, so this degrades to
+    // "local-only bundle" instead of refusing to start.
+    this.taskerSnapshotClient = createTaskerSnapshotClientOrStub(config);
+    this.companionObservationClient = createCompanionObservationClientOrStub(config);
+    this.petStateClient = createPetStateClientOrStub(config);
+    this.observationBundleBuilder = createObservationBundleBuilder({
+      currentStateStore: this.currentStateStore,
+      memoryStore: this.memoryStore,
+      taskerSnapshotClient: this.taskerSnapshotClient,
+      companionObservationClient: this.companionObservationClient,
+    });
+
+    // Stochastic Pulse (task #9-11) and Event Opportunity (task #13) share one
+    // queue (system-message-queue-store) and one drain consumer
+    // (runProactiveDrainTick, folded into the existing Pulse tick below) —
+    // both pollers only ever enqueue, never call Claude themselves.
+    this.systemMessageQueueStore = createSystemMessageQueueStore(config);
+    this.checkinConfigStore = createCheckinConfigStore(config);
+    this.systemCheckinPoller = createSystemCheckinPoller({
+      queueStore: this.systemMessageQueueStore,
+      checkinConfigStore: this.checkinConfigStore,
+      buildObservationBundle: () => this.observationBundleBuilder.build(),
+      onLog: (msg) => console.log(`[cyberboss] ${msg}`),
+    });
+    this.eventOpportunityStateStore = createEventOpportunityStateStore(config);
+    this.eventOpportunityPoller = createEventOpportunityPoller({
+      queueStore: this.systemMessageQueueStore,
+      stateStore: this.eventOpportunityStateStore,
+      buildObservationBundle: () => this.observationBundleBuilder.build(),
+      intervalMs: config.eventOpportunityIntervalMs,
+      cooldownMs: config.eventOpportunityCooldownMs,
+      longSilenceMs: config.eventOpportunityLongSilenceMs,
+      onLog: (msg) => console.log(`[cyberboss] ${msg}`),
+    });
   }
 
   printDoctor() {
@@ -105,10 +159,14 @@ class CyberbossApp {
     console.log("[cyberboss] bridge loop started; waiting for WeChat messages.");
 
     this.startPulse();
+    this.systemCheckinPoller.start();
+    this.eventOpportunityPoller.start();
 
     const shutdown = createShutdownController(async () => {
       this.clearMergeTimers();
       this.stopPulse();
+      this.systemCheckinPoller.stop();
+      this.eventOpportunityPoller.stop();
     });
 
     try {
@@ -140,6 +198,8 @@ class CyberbossApp {
       shutdown.dispose();
       this.clearMergeTimers();
       this.stopPulse();
+      this.systemCheckinPoller.stop();
+      this.eventOpportunityPoller.stop();
     }
   }
 
@@ -151,6 +211,15 @@ class CyberbossApp {
   // resume_topic is untouched: still only injected on the next real inbound
   // turn, never sent proactively by Pulse (spec §6 already said this; Pulse
   // doesn't change it).
+  //
+  // Session 4 (task #14): the same tick also calls runProactiveDrainTick(),
+  // which *can* reach Claude (unlike the intentions check) — Stochastic Pulse
+  // and Event Opportunity only ever enqueue, this is the one place that
+  // actually drains system-message-queue-store. Riding the same 60s interval
+  // and the same pulseTickInFlight guard rather than adding a fourth timer:
+  // both halves already need the identical "never run concurrently with
+  // yourself, never preempt Morrow" posture, so there is nothing a separate
+  // timer would buy.
   startPulse() {
     this.pulseTimer = setInterval(() => {
       void this.runPulseTick();
@@ -171,17 +240,89 @@ class CyberbossApp {
   // guard exists to rule out. The store's own atomic writes protect against
   // corruption either way, but not against two ticks both deciding the same
   // pending intention is still due before either one's resolve() lands.
+  //
+  // The two halves are independent try/catches so one failing (e.g. a
+  // malformed intention) never skips the other — both still run under the
+  // same in-flight guard, so they still never overlap with the *next* tick.
   async runPulseTick() {
     if (this.pulseTickInFlight) {
       return;
     }
     this.pulseTickInFlight = true;
     try {
-      await this.runDueIntentionsCheck();
-    } catch (error) {
-      console.error(`[cyberboss] pulse tick failed: ${formatErrorMessage(error)}`);
+      await this.runDueIntentionsCheck().catch((error) => {
+        console.error(`[cyberboss] pulse tick (intentions) failed: ${formatErrorMessage(error)}`);
+      });
+      await this.runProactiveDrainTick().catch((error) => {
+        console.error(`[cyberboss] pulse tick (proactive drain) failed: ${formatErrorMessage(error)}`);
+      });
     } finally {
       this.pulseTickInFlight = false;
+    }
+  }
+
+  // Task #14: drains system-message-queue-store (populated by Stochastic
+  // Pulse / Event Opportunity) and, for each queued message, runs exactly one
+  // real proactive Claude turn against proactive-result-schema.js's narrow
+  // contract and applies whatever it decided. Non-blocking try-lock, same as
+  // runDueIntentionsCheck — busy (Morrow or a real WeChat turn holding the
+  // lock) just means "skip this tick, the message stays queued, try again
+  // next tick" (hasPending() on the producer side already stops a new
+  // wake-up from stacking on top of an undrained one).
+  //
+  // No allowedSenderId yet (bootstrap not done) is a hard skip before even
+  // touching the lock: a proactive turn that can only ever end in `silent`
+  // (nowhere to send `send_message` to) isn't worth a Claude call.
+  async runProactiveDrainTick() {
+    const queueState = this.systemMessageQueueStore.load();
+    if (!this.systemMessageQueueStore.hasPending(queueState)) {
+      return { drained: false, reason: "empty" };
+    }
+
+    const allowedSenderId = this.senderGate.getAllowedSenderId();
+    if (!allowedSenderId) {
+      return { drained: false, reason: "no_allowed_sender" };
+    }
+
+    const lock = await tryAcquireHostLock({ lockDir: this.config.hostLockDir, kind: "proactive_turn" });
+    if (!lock.acquired) {
+      return { drained: false, reason: "lock_busy" };
+    }
+
+    try {
+      const { drained, state: nextQueueState } = this.systemMessageQueueStore.drainAll(queueState);
+      this.systemMessageQueueStore.save(nextQueueState);
+
+      const results = [];
+      // Producers only enqueue when hasPending() was false, so in practice
+      // this is 0 or 1 messages — processed sequentially regardless, so a
+      // rare race that let two land here never fires two Claude calls at once.
+      for (const message of drained) {
+        const result = await processProactiveMessage(message, {
+          callRuntime: (prompt) => this.runtimeAdapter.sendSingleTurn({ text: prompt, resultSchema: PROACTIVE_RESULT_JSON_SCHEMA }),
+          // Task #12 round 2: a fresher, unsmoothed read of the same raw
+          // package/activity/title/URL signal KekeAccessibilityService
+          // already collects — never a screenshot/image, see
+          // companion-observation.js's getLatestScreenContext comment.
+          fetchRefreshedContext: () => this.companionObservationClient.getLatestScreenContext(),
+          sendMessage: (text) => this.channelAdapter.sendText({ userId: allowedSenderId, text }).then(() => true).catch((error) => {
+            console.error(`[cyberboss] proactive send failed: ${formatErrorMessage(error)}`);
+            return false;
+          }),
+          pushExpression: (payload) => this.petStateClient.pushExpression(payload),
+          markAgentMessageSent: (nowIso) => {
+            const state = this.currentStateStore.load();
+            this.currentStateStore.save(this.currentStateStore.applyPatch(state, {}, { lastAgentMessageAt: nowIso }));
+          },
+          onLog: (msg) => console.log(`[cyberboss] ${msg}`),
+        });
+        results.push(result);
+        // Spec §7 posture carried over: never log message bodies, only metadata.
+        console.log(JSON.stringify({ mode: "proactive_turn", source: message.source, action: result.action, sent: result.sent }));
+      }
+      return { drained: true, results };
+    } finally {
+      await lock.release();
     }
   }
 
@@ -428,6 +569,47 @@ class CyberbossApp {
     }
     return result;
   }
+}
+
+// Observation credentials (CYBERBOSS_TASKER_SUPABASE_*/CYBERBOSS_COMPANION_SUPABASE_*)
+// aren't set in production yet (task #9-11 added the adapters, not the real
+// keys) — createSupabaseRestClient throws synchronously if baseUrl/anonKey are
+// missing, so constructing the real adapter unconditionally in CyberbossApp's
+// constructor would make the whole process fail to boot. These stubs keep
+// boot unconditional; the rejection surfaces per-call instead, exactly where
+// observation-bundle.js already expects a source to possibly fail (it catches
+// and turns it into `{error}` rather than failing the whole bundle).
+function createTaskerSnapshotClientOrStub(config) {
+  if (config.taskerSupabaseUrl && config.taskerSupabaseAnonKey) {
+    return createTaskerSnapshotClient(config);
+  }
+  return {
+    async getSnapshot() {
+      throw new Error("tasker observation not configured (CYBERBOSS_TASKER_SUPABASE_URL/ANON_KEY unset)");
+    },
+  };
+}
+
+function createCompanionObservationClientOrStub(config) {
+  if (config.companionSupabaseUrl && config.companionSupabaseAnonKey) {
+    return createCompanionObservationClient(config);
+  }
+  return {
+    async getRecentSegments() {
+      throw new Error("companion observation not configured (CYBERBOSS_COMPANION_SUPABASE_URL/ANON_KEY unset)");
+    },
+  };
+}
+
+function createPetStateClientOrStub(config) {
+  if (config.companionSupabaseUrl && config.companionSupabaseAnonKey) {
+    return createPetStateClient(config);
+  }
+  return {
+    async pushExpression() {
+      throw new Error("pet-state not configured (CYBERBOSS_COMPANION_SUPABASE_URL/ANON_KEY unset)");
+    },
+  };
 }
 
 // sendFn must be plain delivery, never a second Claude call, so the outbound

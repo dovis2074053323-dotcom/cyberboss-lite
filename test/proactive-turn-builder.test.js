@@ -3,13 +3,36 @@ const assert = require("node:assert/strict");
 
 const { buildProactiveTurnPrompt } = require("../src/core/proactive-turn-builder");
 
-test("includes the narrow-contract JSON examples and system-action framing", () => {
+test("round 1 (no refreshedContext): includes the narrow-contract JSON examples including need_context", () => {
   const prompt = buildProactiveTurnPrompt({});
   assert.match(prompt, /SYSTEM ACTION MODE: internal proactive check/);
   assert.match(prompt, /"action":"send_message"/);
   assert.match(prompt, /"action":"silent"/);
-  assert.match(prompt, /"action":"need_vision"/);
+  assert.match(prompt, /"action":"need_context"/);
   assert.match(prompt, /"action":"defer"/);
+});
+
+test("round 2 (refreshedContext given): drops need_context from the menu entirely, renders the refreshed rows", () => {
+  const prompt = buildProactiveTurnPrompt({}, {
+    refreshedContext: [{ created_at: "2026-08-09T12:00:00Z", detail: { package: "com.tencent.mm", activity: "ChattingUI" } }],
+  });
+  assert.match(prompt, /round 2/);
+  assert.match(prompt, /Refreshed Accessibility context:\n- 2026-08-09T12:00:00Z: {"package":"com\.tencent\.mm","activity":"ChattingUI"}/);
+  assert.match(prompt, /"action":"send_message"/);
+  assert.match(prompt, /"action":"silent"/);
+  assert.match(prompt, /"action":"defer"/);
+  assert.doesNotMatch(prompt, /"action":"need_context"/);
+});
+
+test("round 2 with an error marker renders (unavailable), still drops need_context", () => {
+  const prompt = buildProactiveTurnPrompt({}, { refreshedContext: { error: "companion down" } });
+  assert.match(prompt, /Refreshed Accessibility context: \(unavailable — companion down\)/);
+  assert.doesNotMatch(prompt, /"action":"need_context"/);
+});
+
+test("round 2 with an empty array renders (none)", () => {
+  const prompt = buildProactiveTurnPrompt({}, { refreshedContext: [] });
+  assert.match(prompt, /Refreshed Accessibility context: \(none\)/);
 });
 
 test("renders open loops and core memory as bullet lists when present", () => {

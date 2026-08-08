@@ -10,8 +10,8 @@ test("accepts a well-formed send_message", () => {
   assert.equal(result.message, "在呢");
 });
 
-test("accepts silent/need_vision/defer with message: null", () => {
-  for (const action of ["silent", "need_vision", "defer"]) {
+test("accepts silent/need_context/defer with message: null", () => {
+  for (const action of ["silent", "need_context", "defer"]) {
     const result = evaluateProactiveResult({ action, message: null });
     assert.equal(result.fatal, false, action);
     assert.equal(result.message, null, action);
@@ -63,5 +63,5 @@ test("fatal: reason exceeds max length", () => {
 });
 
 test("ACTIONS is exactly the four decided actions, no more no less", () => {
-  assert.deepEqual([...ACTIONS].sort(), ["defer", "need_vision", "send_message", "silent"]);
+  assert.deepEqual([...ACTIONS].sort(), ["defer", "need_context", "send_message", "silent"]);
 });

@@ -48,7 +48,12 @@ function createClaudeCodeRuntimeAdapter(config) {
       };
     },
 
-    async sendSingleTurn({ text }) {
+    // resultSchema: optional override of the normal-turn RESULT_JSON_SCHEMA —
+    // used by proactive turns (task #14) to pass proactive-result-schema.js's
+    // narrow PROACTIVE_RESULT_JSON_SCHEMA instead, so the CLI itself refuses
+    // to hand back anything shaped like memory/loop/intention writes rather
+    // than relying on the caller to just not read those fields.
+    async sendSingleTurn({ text, resultSchema }) {
       if (!normalizeText(config.sharedCredentialsFile)) {
         throw new Error("CYBERBOSS_SHARED_CREDENTIALS_FILE is not configured");
       }
@@ -56,7 +61,7 @@ function createClaudeCodeRuntimeAdapter(config) {
       await runAclPreflightOrThrow();
 
       try {
-        return await attemptTurn({ text, config, systemPrompt, command });
+        return await attemptTurn({ text, config, systemPrompt, command, resultSchema });
       } catch (error) {
         if (!error.notLoggedIn) {
           throw error;
@@ -67,7 +72,7 @@ function createClaudeCodeRuntimeAdapter(config) {
         // up rather than loop.
         console.error("[cyberboss] claude reported not-logged-in; retrying acl preflight once");
         await runAclPreflightOrThrow();
-        return await attemptTurn({ text, config, systemPrompt, command });
+        return await attemptTurn({ text, config, systemPrompt, command, resultSchema });
       }
     },
   };
@@ -99,12 +104,12 @@ function runAclPreflight() {
   });
 }
 
-async function attemptTurn({ text, config, systemPrompt, command }) {
+async function attemptTurn({ text, config, systemPrompt, command, resultSchema }) {
   fs.mkdirSync(config.claudeConfigDirRoot, { recursive: true });
   const configDir = fs.mkdtempSync(path.join(config.claudeConfigDirRoot, "cfg-"));
   try {
     fs.symlinkSync(config.sharedCredentialsFile, path.join(configDir, ".credentials.json"));
-    const args = buildArgs({ text, config, systemPrompt });
+    const args = buildArgs({ text, config, systemPrompt, resultSchema });
     const env = buildEnv({ configDir });
     const raw = await runClaudeProcess({
       command,
@@ -132,14 +137,14 @@ async function attemptTurn({ text, config, systemPrompt, command }) {
   }
 }
 
-function buildArgs({ text, config, systemPrompt }) {
+function buildArgs({ text, config, systemPrompt, resultSchema }) {
   const args = [
     "-p", text,
     "--safe-mode",
     "--tools", "",
     "--no-session-persistence",
     "--output-format", "json",
-    "--json-schema", RESULT_SCHEMA_JSON,
+    "--json-schema", resultSchema ? JSON.stringify(resultSchema) : RESULT_SCHEMA_JSON,
   ];
   if (systemPrompt) {
     args.push("--system-prompt", systemPrompt);
