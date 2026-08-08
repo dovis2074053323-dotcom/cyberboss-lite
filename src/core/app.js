@@ -430,19 +430,25 @@ class CyberbossApp {
   }
 }
 
-// Interpretation call (mirrors session 2's documented gap-fills): sendFn must be
-// plain delivery, never a second Claude call, so the outbound text has to come
-// straight from data the model already wrote at creation time. `reason` is the
-// model's own natural-language justification for the intention (spec §6
-// required field) and is the closest thing to "what to say" without a rephrase
-// call; `context` is optional supplementary detail appended when present.
+// sendFn must be plain delivery, never a second Claude call, so the outbound
+// text has to come straight from data the model already wrote at creation
+// time. `deliveryText` is the field meant for that (see result-schema.js's
+// per-item intentions validation and intentions-store.js's create()) — `reason`
+// is only the model's internal justification for *why* the intention exists
+// and must never be sent as-is (real bug found live: a reminder for "cc很萌"
+// went out as "用户要求五分钟后发送指定文字" because this function used to send
+// `reason`). Fallback to `reason` only covers intentions persisted before this
+// field existed; every intention created after this fix always has a real
+// `deliveryText`.
 function buildIntentionMessageText(intention) {
+  const deliveryText = String(intention?.deliveryText || "").trim();
   const reason = String(intention?.reason || "").trim();
   const context = String(intention?.context || "").trim();
-  if (!reason) {
+  const primary = deliveryText || reason;
+  if (!primary) {
     return "";
   }
-  return context ? `${reason}\n${context}` : reason;
+  return context ? `${primary}\n${context}` : primary;
 }
 
 function sweepStaleClaudeConfigDirs(configDirRoot) {
@@ -503,4 +509,4 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-module.exports = { CyberbossApp };
+module.exports = { CyberbossApp, buildIntentionMessageText };

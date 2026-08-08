@@ -79,29 +79,38 @@ test("a valid turn with a successful send applies statePatch, memory, loops, int
   assert.deepEqual(episode.messages.map((m) => m.role), ["user", "assistant"]);
 });
 
-test("an invalid structured result applies nothing", async () => {
+// A fatally malformed structured result (here: missing required top-level
+// fields, so `reply` itself can't be trusted) used to drop the user's own
+// message from history along with everything else — found live, this is
+// exactly the shape of the "typing… then nothing" bug: no reply, no episode
+// record, no indication to the user that anything went wrong at all. The user
+// message must survive regardless, and a fixed fallback notice — never
+// silence — must still reach WeChat.
+test("a fatally malformed structured result still records the user's message and sends a fallback notice, never silence", async () => {
   const { stores, coordinator } = makeHarness();
   const prepared = await coordinator.prepareTurn({
     agentName: "test", receivedAtIso: "2026-08-06T10:00:00.000Z", receivedAtLocal: "10:00", mergedText: "hi",
   });
 
-  let sendCalled = false;
+  const sent = [];
   const result = await coordinator.applyTurn({
     structuredResult: { reply: "hi", statePatch: {} }, // missing required fields
     turnUserText: "hi",
     receivedAtIso: "2026-08-06T10:00:00.000Z",
     prepared,
-    sendReply: async () => { sendCalled = true; return true; },
+    sendReply: async (text) => { sent.push(text); return true; },
   });
 
   assert.equal(result.applied, false);
   assert.equal(result.reason, "invalid_structured_result");
-  assert.equal(sendCalled, false);
+  assert.equal(sent.length, 1);
+  assert.ok(sent[0].length > 0);
   const episode = stores.episodeStore.load();
-  assert.equal(episode.messages.length, 0);
+  assert.deepEqual(episode.messages.map((m) => m.role), ["user", "assistant"]);
+  assert.equal(episode.messages[0].text, "hi");
 });
 
-test("a WeChat send failure voids the whole turn: no state, memory, or episode changes", async () => {
+test("a WeChat send failure voids state/memory but still records the user's own message", async () => {
   const { stores, coordinator } = makeHarness();
   const prepared = await coordinator.prepareTurn({
     agentName: "test", receivedAtIso: "2026-08-06T10:00:00.000Z", receivedAtLocal: "10:00", mergedText: "我喜欢猫",
@@ -122,7 +131,109 @@ test("a WeChat send failure voids the whole turn: no state, memory, or episode c
   assert.equal(result.reason, "send_failed");
   assert.equal(stores.memoryStore.load().memories.length, 0);
   assert.equal(stores.currentStateStore.load().lastAgentMessageAt, null);
-  assert.equal(stores.episodeStore.load().messages.length, 0);
+  const episode = stores.episodeStore.load();
+  assert.deepEqual(episode.messages.map((m) => m.role), ["user"]);
+  assert.equal(episode.messages[0].text, "我喜欢猫");
+});
+
+// The actual live bug (2026-08-08): setting a reminder produced a
+// sourceQuote that failed the old exact-match check, which voided the whole
+// turn — the user saw "对方正在输入…" and then nothing, repeatedly, for a
+// reply that had nothing wrong with it. Now: the reply still ships, plus an
+// explicit, unmissable notice that the reminder itself did not get set — never
+// silence, and never a reply that goes out looking like success when it wasn't.
+test("an intention creation failure never blocks the reply, and never stays silent about the failure", async () => {
+  const { stores, coordinator } = makeHarness();
+  const prepared = await coordinator.prepareTurn({
+    agentName: "test", receivedAtIso: "2026-08-06T10:00:00.000Z", receivedAtLocal: "10:00", mergedText: "五分钟之后给我发一句：cc很萌。",
+  });
+
+  const sent = [];
+  const result = await coordinator.applyTurn({
+    structuredResult: validResult({
+      reply: "行吧，五分钟后说给你听。",
+      intentions: {
+        create: [{
+          type: "reminder",
+          reason: "用户要求五分钟后发送指定文字",
+          sourceQuote: "五分钟之后给我发一句：cc很萌。",
+          dueAt: "2026-08-06T10:05:00.000Z",
+          // deliveryText deliberately omitted — this is exactly the shape of
+          // the live bug, caught now at the schema layer instead of silently
+          // sending `reason` as the message.
+        }],
+        resolve: [],
+      },
+    }),
+    turnUserText: "五分钟之后给我发一句：cc很萌。",
+    receivedAtIso: "2026-08-06T10:00:00.000Z",
+    prepared,
+    sendReply: async (text) => { sent.push(text); return true; },
+  });
+
+  assert.equal(result.applied, true);
+  assert.equal(sent.length, 1);
+  assert.ok(sent[0].startsWith("行吧，五分钟后说给你听。"), "the model's own reply must still ship");
+  assert.match(sent[0], /没有设置成功/, "an explicit, unmissable failure notice must be appended");
+  assert.equal(stores.intentionsStore.load().intentions.length, 0, "the malformed candidate must not have been created");
+});
+
+// Business-layer creation failures (bad dueAt, pending cap) deserve the same
+// user-visible notice as a schema-layer one — both mean "the thing the user
+// explicitly asked for did not actually get set."
+test("a store-level intention rejection (e.g. dueAt in the past) also produces a failure notice, not silence", async () => {
+  const { stores, coordinator } = makeHarness();
+  const prepared = await coordinator.prepareTurn({
+    agentName: "test", receivedAtIso: "2026-08-06T10:00:00.000Z", receivedAtLocal: "10:00", mergedText: "提醒我喝水",
+  });
+
+  const sent = [];
+  const result = await coordinator.applyTurn({
+    structuredResult: validResult({
+      reply: "好嘞",
+      intentions: {
+        create: [{
+          type: "reminder", reason: "喝水", sourceQuote: "提醒我喝水", deliveryText: "该喝水啦",
+          dueAt: "2020-01-01T00:00:00.000Z", // already in the past
+        }],
+        resolve: [],
+      },
+    }),
+    turnUserText: "提醒我喝水",
+    receivedAtIso: "2026-08-06T10:00:00.000Z",
+    prepared,
+    sendReply: async (text) => { sent.push(text); return true; },
+  });
+
+  assert.equal(result.applied, true);
+  assert.match(sent[0], /没有设置成功/);
+  assert.equal(stores.intentionsStore.load().intentions.length, 0);
+});
+
+// Ordinary memory/loop item failures stay quiet to the user (just dropped +
+// logged in diagnostics) — only intention-create failures earn a user-facing
+// notice, since only those are "something the user explicitly asked for."
+test("a dropped memory item does not add any notice to the reply", async () => {
+  const { coordinator } = makeHarness();
+  const prepared = await coordinator.prepareTurn({
+    agentName: "test", receivedAtIso: "2026-08-06T10:00:00.000Z", receivedAtLocal: "10:00", mergedText: "今天天气不错",
+  });
+
+  const sent = [];
+  const result = await coordinator.applyTurn({
+    structuredResult: validResult({
+      reply: "是呀，挺好的",
+      memory: { remember: [{ category: "preference", fact: "喜欢猫", tier: "core", sourceQuote: "不存在的引用" }], forget: [] },
+    }),
+    turnUserText: "今天天气不错",
+    receivedAtIso: "2026-08-06T10:00:00.000Z",
+    prepared,
+    sendReply: async (text) => { sent.push(text); return true; },
+  });
+
+  assert.equal(result.applied, true);
+  assert.deepEqual(sent, ["是呀，挺好的"]);
+  assert.ok(result.diagnostics.some((d) => d.includes("memory items dropped")));
 });
 
 test("a silent reply (null) still applies state but never sets lastAgentMessageAt and never calls sendReply", async () => {

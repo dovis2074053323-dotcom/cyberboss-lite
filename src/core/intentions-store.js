@@ -126,6 +126,12 @@ function createIntentionsStore(config) {
       expiresAt: resolveExpiresAt(candidate, { nowMs }),
       reason: candidate.reason,
       context: candidate.context || "",
+      // The literal text to deliver when this fires — deliberately separate from
+      // `reason` (why the intention exists, never sent to the user) and
+      // `sourceQuote` (the verbatim evidence it was actually requested). Bug
+      // found live: app.js used to send `reason` itself, so a reminder for
+      // "cc很萌" went out as "用户要求五分钟后发送指定文字" instead.
+      deliveryText: candidate.deliveryText || "",
       sourceQuote: candidate.sourceQuote,
       sourceTurnId: sourceTurnId || "",
       cancelOnInbound: defaultCancelOnInbound(candidate.type),
