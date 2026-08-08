@@ -47,6 +47,10 @@ class CyberbossApp {
     // fires first flushes. See scheduleMergeFlush/clearMergeTimers.
     this.idleTimer = null;
     this.maxWaitTimer = null;
+    // Pulse (session 3): drives Future Intentions only, no autonomous
+    // "reach out to chat" heartbeat. See startPulse/runPulseTick.
+    this.pulseTimer = null;
+    this.pulseTickInFlight = false;
   }
 
   printDoctor() {
@@ -100,8 +104,11 @@ class CyberbossApp {
     console.log(`[cyberboss] allowedSenderId=${this.senderGate.getAllowedSenderId() || "(bootstrap pending)"}`);
     console.log("[cyberboss] bridge loop started; waiting for WeChat messages.");
 
+    this.startPulse();
+
     const shutdown = createShutdownController(async () => {
       this.clearMergeTimers();
+      this.stopPulse();
     });
 
     try {
@@ -132,6 +139,49 @@ class CyberbossApp {
     } finally {
       shutdown.dispose();
       this.clearMergeTimers();
+      this.stopPulse();
+    }
+  }
+
+  // Pulse (session 3, deliberately minimal): a 60s tick (config.pulseIntervalMs)
+  // that does exactly one thing — call runDueIntentionsCheck(), which is a
+  // real no-op (no lock attempt, no send, no Claude call) whenever nothing is
+  // due. This is *not* an autonomous "check in just to be present" heartbeat —
+  // it only ever drives already-created reminder/check_in Future Intentions.
+  // resume_topic is untouched: still only injected on the next real inbound
+  // turn, never sent proactively by Pulse (spec §6 already said this; Pulse
+  // doesn't change it).
+  startPulse() {
+    this.pulseTimer = setInterval(() => {
+      void this.runPulseTick();
+    }, this.config.pulseIntervalMs);
+  }
+
+  stopPulse() {
+    if (this.pulseTimer) {
+      clearInterval(this.pulseTimer);
+      this.pulseTimer = null;
+    }
+  }
+
+  // Reentrancy guard: if a previous tick is still awaiting a WeChat send (or
+  // waiting out a busy non-blocking try-lock's own async round-trip) when the
+  // next interval fires, skip — two overlapping ticks reading/writing
+  // intentions.json concurrently is exactly the kind of double-send this
+  // guard exists to rule out. The store's own atomic writes protect against
+  // corruption either way, but not against two ticks both deciding the same
+  // pending intention is still due before either one's resolve() lands.
+  async runPulseTick() {
+    if (this.pulseTickInFlight) {
+      return;
+    }
+    this.pulseTickInFlight = true;
+    try {
+      await this.runDueIntentionsCheck();
+    } catch (error) {
+      console.error(`[cyberboss] pulse tick failed: ${formatErrorMessage(error)}`);
+    } finally {
+      this.pulseTickInFlight = false;
     }
   }
 
@@ -341,14 +391,12 @@ class CyberbossApp {
     }
   }
 
-  // Spec §6 execution interface, wired for real in session 3: who actually
-  // *calls* this (Pulse's trigger source) is still open — see docs/cyberboss-lite-status.md
-  // "For session 3" — but the call itself is complete and safe to invoke today:
-  // non-blocking try-lock (never waits, never preempts Morrow — HostLockBusyError
-  // just means "skip this tick"), gated by config.enableScheduledIntentions
-  // (still false until that's explicitly flipped), and sendFn is a plain WeChat
-  // delivery — never a Claude turn, so it can't recursively create intentions/
-  // memory/handoff (spec §6's explicit ban).
+  // Spec §6 execution interface, wired for real in session 3 and now called by
+  // Pulse's 60s tick (runPulseTick above). Non-blocking try-lock (never waits,
+  // never preempts Morrow — HostLockBusyError just means "skip this tick, try
+  // again next tick"), gated by config.enableScheduledIntentions, and sendFn is
+  // a plain WeChat delivery — never a Claude turn, so it can't recursively
+  // create intentions/memory/handoff (spec §6's explicit ban).
   async runDueIntentionsCheck() {
     const allowedSenderId = this.senderGate.getAllowedSenderId();
     if (!allowedSenderId) {

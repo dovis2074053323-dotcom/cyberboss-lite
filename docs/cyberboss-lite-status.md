@@ -567,16 +567,18 @@ one more preflight call, at systemd unit start (before the bridge loop begins
 accepting messages) — still not a recurring heartbeat, just one more
 call site of the same synchronous check.
 
-## Session 3 (real host lock, bubble-merge retune, systemd) — in progress
+## Session 3 (real host lock, bubble-merge retune, systemd, Pulse) — in progress
 
 No written spec doc for session 3 exists (unlike session 2's committed
-`docs/session-2-spec.md`) — scope came directly from vv in chat, in this
-order: real host lock → WeChat-turn blocking wait → Pulse/intentions
-non-blocking try-lock → status.json stays observation-only → bubble-merge
-retune → systemd → startup ACL preflight → crash/restart verification →
-Pulse + Tasker observation → flip `CYBERBOSS_ENABLE_SCHEDULED_INTENTIONS`.
-**Pulse and Tasker observation are still open** — see the dedicated section
-below; everything else in that list is done and verified live.
+`docs/session-2-spec.md`) — scope came directly from vv in chat, in two
+passes: an initial ordered list (host lock → WeChat-turn blocking wait →
+Pulse/intentions non-blocking try-lock → status.json observation-only →
+bubble-merge retune → systemd → startup ACL preflight → crash/restart
+verification → Pulse + Tasker → flip the flag), then — after Pulse/Tasker
+came back with no real spec anywhere — a follow-up message giving Pulse a
+concrete minimal scope and explicitly deferring Tasker observation to a
+documentation-only note. Everything through Pulse is now done and verified;
+only the final flag flip + live acceptance pass remains (see below).
 
 ### Real host lock (spec: Morrow's `docs/agent-runtime-lock.md`)
 
@@ -732,32 +734,80 @@ sudo, e.g. when run as `cyberboss`) both clean as `cyberboss` on
    session 2 (`loadAllStoresOrExit`) handled the restart with zero special
    handling needed.
 
-### Pulse + Tasker observation — still open, needs a real spec before writing code
+### Pulse — implemented, minimal scope only (vv's follow-up spec)
 
-Neither `docs/session-2-spec.md` (explicitly excludes both) nor the session-2
-status doc's "For session 3" note (only names them as headings) define what
-either one actually *is*: what triggers a Pulse tick, what "Tasker
-observation" observes or how it's delivered to this process, what either one
-is allowed to do once triggered (call Claude? just check due intentions?),
-or how "event-first, not a high-frequency poller" cashes out concretely.
-`runDueIntentionsCheck()` (see above) is the ready-to-call execution side —
-whatever Pulse turns out to be, it very likely just needs to call that
-method — but nothing calls it yet, and no scheduler/trigger exists. Asked vv
-for the concrete spec before guessing at a design that could end up sending
-real proactive WeChat messages on the wrong trigger.
+vv gave a concrete, deliberately narrow spec in chat (no committed spec doc —
+same as the rest of session 3's ordering) after the "still open" note above:
+Pulse in this stage drives Future Intentions only, **not** an autonomous
+"reach out just to chat" agent heartbeat.
 
-### Remaining before this session can close
+- 60s tick (`config.pulseIntervalMs`, `CYBERBOSS_PULSE_INTERVAL_MS` override
+  for tests — production default matches the spec exactly).
+- The tick itself never calls Claude. It only calls the already-wired
+  `runDueIntentionsCheck()` (see above), which was already a true no-op —
+  zero lock attempts, zero sends, zero model calls — whenever nothing is due
+  (`executeDueIntentions`'s `due` array is empty, so its `for` loop never
+  runs). No separate "is anything due" pre-check was needed; the existing
+  session-2 code already had this property.
+- Uses the same non-blocking `tryAcquireHostLock` `runDueIntentionsCheck()`
+  already wired in: lock free → sends; Morrow or another Cyberboss path busy
+  → that intention just stays `pending`, picked up again next tick.
+- No double-send: `executeDueIntentions` only marks an intention `resolved`
+  after a successful `sendFn`, and `runPulseTick()` adds a reentrancy guard
+  (`pulseTickInFlight`) so two overlapping ticks — e.g. a slow WeChat send
+  still in flight when the next 60s interval fires — can never both read the
+  same `pending` state before either one's `resolve()` lands. Both
+  protections are independent and both matter: the reentrancy guard prevents
+  the race at the in-process level, the store's atomic write prevents
+  corruption if it ever happened anyway.
+- `resume_topic` unchanged: Pulse never sends it proactively, still only
+  injected on the next real inbound turn (spec §6, untouched by this).
+- Lives inside the existing `cyberboss.service` process (`startPulse()`
+  called once in `start()`, right after the bridge-loop-ready log line;
+  `stopPulse()` in the shutdown handler alongside `clearMergeTimers()`) — no
+  second daemon, no cron, no external scheduler.
 
-- Pulse + Tasker observation design + implementation (blocked on spec above).
-- Flip `CYBERBOSS_ENABLE_SCHEDULED_INTENTIONS=true` in `/etc/cyberboss.env` —
-  code-complete and lock-safe today, but deliberately held for an explicit
-  go-ahead from vv first: this is the one change in this session that turns
-  on real proactive sends to vv's live WeChat account, which is a
-  hard-to-undo, user-visible action, not just a code change.
-- Final acceptance pass once the above land: all 6 scenarios vv listed
-  (Morrow-busy → Cyberboss queues/waits; Morrow-idle → Cyberboss acquires;
-  Cyberboss-busy → Morrow queues; Cyberboss mid-turn + 2-3 WeChat messages →
-  next pending batch; idle + a few messages → merge within 1.5-4s; either
-  side `kill -9`'d → lock auto-releases). The lock/merge/crash-safety pieces
-  of this are already verified individually above; what's outstanding is one
-  combined live pass once Pulse/Tasker/the flag are also in place.
+Tested in `test/app-pulse.test.js` (fast `pulseIntervalMs` overrides, no real
+I/O — stubs `runDueIntentionsCheck` directly): fires on interval, never
+touches `sendSingleTurn` (proof that the tick path can't reach Claude even
+indirectly), reentrancy guard blocks concurrent execution and correctly
+resets after both a normal completion and a thrown error, `stopPulse()`
+actually stops future ticks. `test/app-bubble-merge.test.js`'s shared setup
+was extracted to `test/helpers/app-test-config.js` in the same pass (no
+behavior change, just removed ~50 lines of duplicated fixture code once a
+second test file needed the same `CyberbossApp` construction helper).
+
+### Tasker observation — direction recorded, not implemented this session
+
+Per vv's explicit instruction: don't guess the Android → Cyberboss transport
+protocol, don't add an HTTP server/auth/public ingress this round. This
+section is the recorded design boundary for a future session, not a
+committed interface:
+
+- Future Tasker-side observations Cyberboss should eventually be able to
+  receive: battery level, charging status, location/place semantics, health
+  data, app-usage duration.
+- These are **external event inputs**, conceptually similar in shape to a
+  WeChat inbound message but from a different channel — they may update
+  `current-state.json` fields or trigger a `check_in` intention *with a
+  concrete reason* (spec §6's existing check_in rule — "必须有具体对话理由" —
+  already rules out a generic "phone at 12%" ping becoming a check-in on its
+  own; whatever eventually consumes these observations needs to translate a
+  raw reading into a real reason, not forward it verbatim).
+- Same non-negotiable constraint as Pulse: observations must **not** trigger
+  a Claude call per-observation. A battery-percentage update firing every few
+  minutes calling Claude each time would be exactly the "high-frequency
+  poller" both this session's Pulse spec and the original spec's "event-first"
+  framing rule out.
+- Transport, auth, wire format, and how an observation actually reaches this
+  process are all explicitly undecided — to be designed in a dedicated
+  session once the Android side's data format is worked out separately. No
+  code, no new dependencies, no open port added this session.
+
+### Final live acceptance — see the dedicated section below
+
+`CYBERBOSS_ENABLE_SCHEDULED_INTENTIONS` flip and the real end-to-end WeChat
+verification (real reminder send, resolve-without-duplicate, lock-busy skip,
+restart recovery of a still-pending intention) are recorded further down
+once run, per vv's explicit go-ahead requirement for turning on real
+proactive sends to a live account.

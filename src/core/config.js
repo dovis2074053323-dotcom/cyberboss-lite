@@ -67,6 +67,13 @@ function readConfig() {
     // not a flat 10s.
     inboundIdleDelayMs: readIntEnv("CYBERBOSS_INBOUND_IDLE_DELAY_MS") || 1_800,
     inboundMaxWaitMs: readIntEnv("CYBERBOSS_INBOUND_MAX_WAIT_MS") || 3_500,
+
+    // Pulse (session 3, minimal scope: drives Future Intentions only, no
+    // autonomous "reach out just to chat" heartbeat). Tick itself never calls
+    // Claude — it only calls the already-wired runDueIntentionsCheck(), which
+    // is a no-op (zero lock attempts, zero sends) when nothing is due.
+    // Overridable only so tests don't have to wait 60 real seconds per tick.
+    pulseIntervalMs: readIntEnv("CYBERBOSS_PULSE_INTERVAL_MS") || 60_000,
   };
 }
 
