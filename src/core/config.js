@@ -47,8 +47,7 @@ function readConfig() {
     episodesDir: path.join(stateDir, "episodes"),
     episodeCurrentFile: path.join(stateDir, "episodes", "current.json"),
     episodeArchiveDir: path.join(stateDir, "episodes", "archive"),
-    // spec §6: real proactive reminder/check_in sending stays off until session 3
-    // wires the host-wide try-lock; resume_topic (no proactive send) can be live.
+    // Future Intentions keep their existing explicit opt-in behavior.
     enableScheduledIntentions: readBoolEnv("CYBERBOSS_ENABLE_SCHEDULED_INTENTIONS", false),
 
     // Session 3: shared cross-project /run/agent-runtime/claude.lock (protocol in
@@ -68,10 +67,9 @@ function readConfig() {
     inboundIdleDelayMs: readIntEnv("CYBERBOSS_INBOUND_IDLE_DELAY_MS") || 1_800,
     inboundMaxWaitMs: readIntEnv("CYBERBOSS_INBOUND_MAX_WAIT_MS") || 3_500,
 
-    // Pulse (session 3, minimal scope: drives Future Intentions only, no
-    // autonomous "reach out just to chat" heartbeat). Tick itself never calls
-    // Claude — it only calls the already-wired runDueIntentionsCheck(), which
-    // is a no-op (zero lock attempts, zero sends) when nothing is due.
+    // Pulse is the existing 60-second cheap tick: it checks Future Intentions,
+    // mandatory outreach slots, and the proactive candidate queue. It does not
+    // build observations or call Claude when there is no due/pending work.
     // Overridable only so tests don't have to wait 60 real seconds per tick.
     pulseIntervalMs: readIntEnv("CYBERBOSS_PULSE_INTERVAL_MS") || 60_000,
 
@@ -92,26 +90,15 @@ function readConfig() {
     morrowBaseUrl: readTextEnv("CYBERBOSS_MORROW_URL") || "http://127.0.0.1:8787",
     contextSnapshotTimeoutMs: readIntEnv("CYBERBOSS_CONTEXT_SNAPSHOT_TIMEOUT_MS") || 15_000,
 
-    // Stochastic Pulse (upstream WenXiaoWendy/cyberboss's
-    // system-checkin-poller.js, ported this session): random-interval wake-up
-    // that only enqueues an observation bundle, never decides content itself —
-    // see docs/cyberboss-lite-status.md session 4 notes once written.
-    checkinConfigFile: path.join(stateDir, "checkin-config.json"),
     systemMessageQueueFile: path.join(stateDir, "system-message-queue.json"),
-    checkinMinIntervalMs: readIntEnv("CYBERBOSS_CHECKIN_MIN_INTERVAL_MS") || 3 * 60_000,
-    checkinMaxIntervalMs: readIntEnv("CYBERBOSS_CHECKIN_MAX_INTERVAL_MS") || 60 * 60_000,
+    proactiveBudgetFile: path.join(stateDir, "proactive-budget.json"),
 
-    // Event Opportunity (task #13): fixed low-frequency poll (unlike Stochastic
-    // Pulse's random interval) that only queues a wake-up when the bundle
-    // actually changed since last observed — see event-opportunity-detector.js.
-    // longSilenceMs defaults to the same 6h episode-store.js already uses for
-    // idle rollover (IDLE_ROLLOVER_MS) — not imported from there on purpose,
-    // these are two independent concerns that happen to agree on "6h of no
-    // inbound message is the point where something has meaningfully lapsed."
+    // Event Opportunity: fixed low-frequency poll with a 30-minute rolling
+    // evidence accumulator. It never calls Claude itself.
     eventOpportunityStateFile: path.join(stateDir, "event-opportunity-state.json"),
     eventOpportunityIntervalMs: readIntEnv("CYBERBOSS_EVENT_OPPORTUNITY_INTERVAL_MS") || 5 * 60_000,
-    eventOpportunityCooldownMs: readIntEnv("CYBERBOSS_EVENT_OPPORTUNITY_COOLDOWN_MS") || 5 * 60_000,
     eventOpportunityLongSilenceMs: readIntEnv("CYBERBOSS_EVENT_OPPORTUNITY_LONG_SILENCE_MS") || 6 * 60 * 60_000,
+    proactiveEvidenceTtlMs: readIntEnv("CYBERBOSS_PROACTIVE_EVIDENCE_TTL_MS") || 30 * 60_000,
   };
 }
 

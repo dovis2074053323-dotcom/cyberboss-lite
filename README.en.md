@@ -54,8 +54,8 @@ Every inbound WeChat message is stamped with local time before it reaches the ru
 2. The Ledger of Life
 Using those timestamps, Cyberboss reconstructs when events start, when they end, and how long they last, then turns fragmented chat into a structured personal timeline.
 
-3. Stochastic Pulse
-At random intervals, the system wakes the agent up and lets it decide what to do next: send a message, stay silent, write in the diary, update the timeline, or use tools.
+3. Evidence-Gated Proactive Outreach
+A cheap local observer accumulates weighted evidence from context, environment, and open loops. Proactive Claude calls are capped at six per local day, separated by 90 minutes, with three persisted daytime outreach slots for natural contact when ordinary evidence stays quiet.
 
 4. Local Reminder Queue
 Reminders are not primarily a user-facing alarm clock. They are how the model leaves instructions for its future self and wakes itself up later.
@@ -71,7 +71,7 @@ If the most interesting part of Cyberboss is the "ledger of life" layer, you can
 - It is an independent project and does not require the WeChat bridge
 - You can plug it into your own agent, bot, or automation stack even if you do not use Codex
 
-Cyberboss builds on top of `timeline-for-agent`, then adds WeChat, reminders, diary writing, and random check-ins around it.
+Cyberboss builds on top of `timeline-for-agent`, then adds WeChat, reminders, diary writing, and evidence-gated proactive outreach around it.
 
 <a id="technical-stack"></a>
 ## Technical Stack
@@ -83,7 +83,7 @@ Cyberboss builds on top of `timeline-for-agent`, then adds WeChat, reminders, di
 - **Task System**
   Local queues for reminders, system triggers, and timeline screenshot jobs.
 - **Capability Layer**
-  Timeline, diary, random check-ins, file delivery, and related runtime actions.
+  Timeline, diary, evidence-gated proactive outreach, file delivery, and related runtime actions.
 - **Optional Tooling**
   MCP or other local hardware / software integrations can be added, but they are optional.
 
@@ -262,11 +262,9 @@ When `CYBERBOSS_RUNTIME=claudecode`, Cyberboss also upserts a workspace-local `.
 - `npm run help`
   Show stable command entrypoints
 
-Here, `checkin` means the random wake-up mechanism, not a fixed periodic reminder.
-
 Switch the runtime with `CYBERBOSS_RUNTIME`. You do not need a different command set for Claude Code.
 
-`npm run start` and `npm run start:checkin` are still useful for minimal local debugging, but they are not the recommended way to observe or debug the real shared bridge workflow.
+`npm run start` is useful for minimal local debugging, but it is not the recommended way to observe or debug the real shared bridge workflow.
 
 ### WeChat commands for end users
 
@@ -284,8 +282,6 @@ Switch the runtime with `CYBERBOSS_RUNTIME`. You do not need a different command
   Switch to a specific thread
 - `/stop`
   Stop the current running turn
-- `/checkin <min>-<max>`
-  Update the proactive random check-in range for the current project
 - `/chunk <number>`
   Adjust the minimum merge size for short WeChat reply chunks
 - `/yes`
@@ -374,11 +370,13 @@ Common contents:
 - `reminder-queue.json`
   reminder queue
 - `system-message-queue.json`
-  system / check-in queue
+  proactive candidate queue
+- `event-opportunity-state.json`
+  rolling observation snapshot and weighted evidence
+- `proactive-budget.json`
+  daily call budget, mandatory slots, delivery state, and recent counters
 - `deferred-system-replies.json`
   replies waiting for the next usable WeChat context token
-- `checkin-config.json`
-  saved proactive check-in range
 - `timeline-screenshot-queue.json`
   screenshot job queue
 - `diary/`
@@ -450,6 +448,7 @@ Agent-facing Cyberboss capabilities are project-native structured tools.
 ## Docs
 
 - [docs/commands.md](./docs/commands.md)
+- [docs/proactive-session-2.md](./docs/proactive-session-2.md)
 
 <a id="faq"></a>
 ## FAQ
@@ -458,9 +457,9 @@ Agent-facing Cyberboss capabilities are project-native structured tools.
 
 Because the project is not published as an npm package yet. Clone the repo and run `npm install` inside it.
 
-### What exactly is `checkin`?
+### How does proactive outreach work?
 
-`checkin` is the random wake-up mechanism. The system wakes the model at a random time and lets it decide whether to show up, stay silent, write data, or act.
+Local observation and evidence accumulation decide when an optional candidate is worth a model call. A six-call daily budget, a 90-minute minimum gap, and three persisted daytime slots keep proactive contact bounded and distributed.
 
 ### Why set user name and gender before the first run?
 

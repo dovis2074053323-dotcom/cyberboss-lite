@@ -19,11 +19,10 @@ const { createCompanionObservationClient } = require("../adapters/observation/co
 const { createMorrowContextRelay } = require("../adapters/observation/morrow-context-relay");
 const { createObservationBundleBuilder } = require("./observation-bundle");
 const { createSystemMessageQueueStore } = require("./system-message-queue-store");
-const { createCheckinConfigStore } = require("./checkin-config-store");
-const { createSystemCheckinPoller } = require("../app/system-checkin-poller");
 const { createEventOpportunityStateStore } = require("./event-opportunity-state-store");
 const { createEventOpportunityPoller } = require("../app/event-opportunity-poller");
-const { PROACTIVE_RESULT_JSON_SCHEMA } = require("./proactive-result-schema");
+const { createProactiveBudgetStore } = require("./proactive-budget-store");
+const { PROACTIVE_RESULT_JSON_SCHEMA, MANDATORY_PROACTIVE_RESULT_JSON_SCHEMA } = require("./proactive-result-schema");
 const { processProactiveMessage } = require("./proactive-turn-runner");
 
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
@@ -58,10 +57,9 @@ class CyberbossApp {
     // fires first flushes. See scheduleMergeFlush/clearMergeTimers.
     this.idleTimer = null;
     this.maxWaitTimer = null;
-    // Pulse (session 3): drives Future Intentions only, no autonomous
-    // "reach out to chat" heartbeat. Session 4 extends the same 60s tick to
-    // also drain the proactive queue (runProactiveDrainTick) under the same
-    // pulseTickInFlight reentrancy guard — see startPulse/runPulseTick below.
+    // Pulse remains the cheap 60s local tick for Future Intentions, mandatory
+    // slots, and the proactive queue drain. Observation building and model
+    // calls happen only after a queued candidate passes the drain gates.
     this.pulseTimer = null;
     this.pulseTickInFlight = false;
 
@@ -83,26 +81,20 @@ class CyberbossApp {
       companionObservationClient: this.companionObservationClient,
     });
 
-    // Stochastic Pulse (task #9-11) and Event Opportunity (task #13) share one
-    // queue (system-message-queue-store) and one drain consumer
-    // (runProactiveDrainTick, folded into the existing Pulse tick below) —
-    // both pollers only ever enqueue, never call Claude themselves.
+    // Event Opportunity and mandatory outreach slots share one queue and one
+    // drain consumer. Both producers remain zero-model local schedulers.
     this.systemMessageQueueStore = createSystemMessageQueueStore(config);
-    this.checkinConfigStore = createCheckinConfigStore(config);
-    this.systemCheckinPoller = createSystemCheckinPoller({
-      queueStore: this.systemMessageQueueStore,
-      checkinConfigStore: this.checkinConfigStore,
-      buildObservationBundle: () => this.observationBundleBuilder.build(),
-      onLog: (msg) => console.log(`[cyberboss] ${msg}`),
-    });
+    this.proactiveBudgetStore = createProactiveBudgetStore(config);
     this.eventOpportunityStateStore = createEventOpportunityStateStore(config);
     this.eventOpportunityPoller = createEventOpportunityPoller({
       queueStore: this.systemMessageQueueStore,
       stateStore: this.eventOpportunityStateStore,
       buildObservationBundle: () => this.observationBundleBuilder.build(),
       intervalMs: config.eventOpportunityIntervalMs,
-      cooldownMs: config.eventOpportunityCooldownMs,
       longSilenceMs: config.eventOpportunityLongSilenceMs,
+      evidenceTtlMs: config.proactiveEvidenceTtlMs,
+      canQueueOptional: () => this.proactiveBudgetStore.getOptionalEligibility(),
+      onMetric: (metric) => this.proactiveBudgetStore.recordMetric(metric),
       onLog: (msg) => console.log(`[cyberboss] ${msg}`),
     });
   }
@@ -156,16 +148,15 @@ class CyberbossApp {
     console.log(`[cyberboss] channel=${this.channelAdapter.describe().id} runtime=${this.runtimeAdapter.describe().id}`);
     console.log(`[cyberboss] account=${account.accountId}`);
     console.log(`[cyberboss] allowedSenderId=${this.senderGate.getAllowedSenderId() || "(bootstrap pending)"}`);
+    this.logProactiveDayState();
     console.log("[cyberboss] bridge loop started; waiting for WeChat messages.");
 
     this.startPulse();
-    this.systemCheckinPoller.start();
     this.eventOpportunityPoller.start();
 
     const shutdown = createShutdownController(async () => {
       this.clearMergeTimers();
       this.stopPulse();
-      this.systemCheckinPoller.stop();
       this.eventOpportunityPoller.stop();
     });
 
@@ -198,28 +189,14 @@ class CyberbossApp {
       shutdown.dispose();
       this.clearMergeTimers();
       this.stopPulse();
-      this.systemCheckinPoller.stop();
       this.eventOpportunityPoller.stop();
     }
   }
 
-  // Pulse (session 3, deliberately minimal): a 60s tick (config.pulseIntervalMs)
-  // that does exactly one thing — call runDueIntentionsCheck(), which is a
-  // real no-op (no lock attempt, no send, no Claude call) whenever nothing is
-  // due. This is *not* an autonomous "check in just to be present" heartbeat —
-  // it only ever drives already-created reminder/check_in Future Intentions.
-  // resume_topic is untouched: still only injected on the next real inbound
-  // turn, never sent proactively by Pulse (spec §6 already said this; Pulse
-  // doesn't change it).
-  //
-  // Session 4 (task #14): the same tick also calls runProactiveDrainTick(),
-  // which *can* reach Claude (unlike the intentions check) — Stochastic Pulse
-  // and Event Opportunity only ever enqueue, this is the one place that
-  // actually drains system-message-queue-store. Riding the same 60s interval
-  // and the same pulseTickInFlight guard rather than adding a fourth timer:
-  // both halves already need the identical "never run concurrently with
-  // yourself, never preempt Morrow" posture, so there is nothing a separate
-  // timer would buy.
+  // The 60s pulse is deliberately cheap when there is no due work: Future
+  // Intentions, mandatory-slot due/missed bookkeeping, and one shared queue
+  // drain. It never builds observations on its own and never calls Claude
+  // without a queued candidate.
   startPulse() {
     this.pulseTimer = setInterval(() => {
       void this.runPulseTick();
@@ -253,6 +230,12 @@ class CyberbossApp {
       await this.runDueIntentionsCheck().catch((error) => {
         console.error(`[cyberboss] pulse tick (intentions) failed: ${formatErrorMessage(error)}`);
       });
+      await this.retryMandatoryDeliveries().catch((error) => {
+        console.error(`[cyberboss] pulse tick (mandatory delivery retry) failed: ${formatErrorMessage(error)}`);
+      });
+      await this.runMandatorySlotCheck().catch((error) => {
+        console.error(`[cyberboss] pulse tick (mandatory slots) failed: ${formatErrorMessage(error)}`);
+      });
       await this.runProactiveDrainTick().catch((error) => {
         console.error(`[cyberboss] pulse tick (proactive drain) failed: ${formatErrorMessage(error)}`);
       });
@@ -261,18 +244,93 @@ class CyberbossApp {
     }
   }
 
-  // Task #14: drains system-message-queue-store (populated by Stochastic
-  // Pulse / Event Opportunity) and, for each queued message, runs exactly one
-  // real proactive Claude turn against proactive-result-schema.js's narrow
-  // contract and applies whatever it decided. Non-blocking try-lock, same as
-  // runDueIntentionsCheck — busy (Morrow or a real WeChat turn holding the
-  // lock) just means "skip this tick, the message stays queued, try again
-  // next tick" (hasPending() on the producer side already stops a new
-  // wake-up from stacking on top of an undrained one).
-  //
-  // No allowedSenderId yet (bootstrap not done) is a hard skip before even
-  // touching the lock: a proactive turn that can only ever end in `silent`
-  // (nowhere to send `send_message` to) isn't worth a Claude call.
+  async retryMandatoryDeliveries() {
+    const allowedSenderId = this.senderGate.getAllowedSenderId();
+    if (!allowedSenderId) return { retried: false, reason: "no_allowed_sender" };
+    const pending = this.proactiveBudgetStore.pendingDeliveries();
+    const results = [];
+    for (const slot of pending) {
+      try {
+        await this.channelAdapter.sendText({ userId: allowedSenderId, text: slot.deliveryText });
+        this.proactiveBudgetStore.markSlotSatisfied(slot.id);
+        this.markAgentMessageSent();
+        results.push({ slotId: slot.id, sent: true });
+        console.log(`[cyberboss] mandatory ${slot.id} delivery retry sent`);
+      } catch (error) {
+        results.push({ slotId: slot.id, sent: false });
+        console.error(`[cyberboss] mandatory ${slot.id} delivery retry failed: ${formatErrorMessage(error)}`);
+      }
+    }
+    return { retried: results.length > 0, results };
+  }
+
+  markAgentMessageSent(nowIso = new Date().toISOString()) {
+    const state = this.currentStateStore.load();
+    this.currentStateStore.save(this.currentStateStore.applyPatch(state, {}, { lastAgentMessageAt: nowIso }));
+  }
+
+  logProactiveDayState() {
+    const state = this.proactiveBudgetStore.load();
+    console.log(JSON.stringify({
+      mode: "proactive_budget",
+      date: state.date,
+      calls: `${state.totalCalls}/${this.proactiveBudgetStore.maxCallsPerDay}`,
+      slots: state.slots.map((slot) => ({ id: slot.id, targetAt: slot.targetAt, satisfied: slot.satisfied, missed: slot.missed })),
+    }));
+  }
+
+  async runMandatorySlotCheck(nowMs = Date.now()) {
+    const expired = this.proactiveBudgetStore.markExpiredSlots(nowMs);
+    for (const slotId of expired.missed) {
+      const queueState = this.systemMessageQueueStore.load();
+      const next = this.systemMessageQueueStore.removeWhere(queueState, (message) => message.forced && message.slotId === slotId);
+      if (next.messages.length !== queueState.messages.length) this.systemMessageQueueStore.save(next);
+      console.log(`[cyberboss] mandatory ${slotId} missed: window ended`);
+    }
+
+    const state = this.proactiveBudgetStore.load(nowMs);
+    const due = state.slots.find((slot) => {
+      const targetAt = new Date(slot.targetAt).getTime();
+      const endAt = new Date(slot.endAt).getTime();
+      return !slot.satisfied && !slot.missed && !slot.deliveryText && nowMs >= targetAt && nowMs < endAt;
+    });
+    if (!due) return { queued: false, reason: "none_due" };
+
+    let queueState = this.systemMessageQueueStore.load();
+    const pending = this.systemMessageQueueStore.peek(queueState);
+    if (pending?.forced && pending.slotId === due.id) {
+      return { queued: false, reason: "already_pending", slotId: due.id };
+    }
+    if (pending?.forced) {
+      return { queued: false, reason: "queue_pending", slotId: pending.slotId || null };
+    }
+
+    const forcedMessage = {
+      id: crypto.randomUUID(),
+      source: "mandatory_slot",
+      createdAt: new Date(nowMs).toISOString(),
+      forced: true,
+      slotId: due.id,
+      reasons: [`mandatory_${due.id}`],
+      evidenceScore: 0,
+    };
+    if (pending && !pending.forced) {
+      // The slot has priority over an optional candidate already waiting in
+      // the single queue. Optional evidence remains in its state file until
+      // its TTL expires; it is not allowed to delay a mandatory window.
+      this.proactiveBudgetStore.recordMetric("candidatesSuppressed");
+      queueState = this.systemMessageQueueStore.replaceFirst(queueState, forcedMessage);
+    } else {
+      queueState = this.systemMessageQueueStore.enqueue(queueState, forcedMessage);
+    }
+    this.systemMessageQueueStore.save(queueState);
+    console.log(`[cyberboss] mandatory ${due.id} due`);
+    return { queued: true, slotId: due.id };
+  }
+
+  // Drains one queue item after the non-blocking host lock and atomic daily
+  // budget gate. The observation bundle and fresh Clawd context are rebuilt
+  // only after both gates pass.
   async runProactiveDrainTick() {
     const queueState = this.systemMessageQueueStore.load();
     if (!this.systemMessageQueueStore.hasPending(queueState)) {
@@ -284,50 +342,129 @@ class CyberbossApp {
       return { drained: false, reason: "no_allowed_sender" };
     }
 
+    const first = this.systemMessageQueueStore.peek(queueState);
+    const nowMs = Date.now();
+    const createdAtMs = new Date(first.createdAt).getTime();
+    if (!first.forced && Number.isFinite(createdAtMs) && nowMs - createdAtMs > this.config.proactiveEvidenceTtlMs) {
+      this.systemMessageQueueStore.save(this.systemMessageQueueStore.takeFirst(queueState).state);
+      this.proactiveBudgetStore.recordMetric("candidatesSuppressed");
+      console.log(`[cyberboss] stale proactive candidate dropped source=${first.source}`);
+      return { drained: true, results: [], reason: "stale" };
+    }
+
+    const forced = first.forced === true || first.source === "mandatory_slot";
+    const eligibility = forced
+      ? this.proactiveBudgetStore.load(nowMs)
+      : this.proactiveBudgetStore.getOptionalEligibility(nowMs);
+    const preflightEligibility = forced
+      ? getForcedEligibility(eligibility, nowMs, this.proactiveBudgetStore)
+      : eligibility;
+    if (!preflightEligibility.allowed) {
+      if (preflightEligibility.reason === "budget_exhausted" || preflightEligibility.reason === "mandatory_budget_reserved") {
+        this.proactiveBudgetStore.recordMetric("budgetBlocked");
+      }
+      console.log(`[cyberboss] proactive ${forced ? "mandatory" : "optional"} blocked: ${preflightEligibility.reason}`);
+      return { drained: false, reason: preflightEligibility.reason };
+    }
+
     const lock = await tryAcquireHostLock({ lockDir: this.config.hostLockDir, kind: "proactive_turn" });
     if (!lock.acquired) {
+      this.proactiveBudgetStore.recordMetric("lockBusy");
+      console.log("[cyberboss] proactive lock busy");
       return { drained: false, reason: "lock_busy" };
     }
 
+    let reservation = null;
+    let runtimeStarted = false;
     try {
-      const { drained, state: nextQueueState } = this.systemMessageQueueStore.drainAll(queueState);
-      this.systemMessageQueueStore.save(nextQueueState);
+      const currentQueueState = this.systemMessageQueueStore.load();
+      const message = this.systemMessageQueueStore.peek(currentQueueState);
+      if (!message) return { drained: false, reason: "empty_after_lock" };
 
-      const results = [];
-      // Producers only enqueue when hasPending() was false, so in practice
-      // this is 0 or 1 messages — processed sequentially regardless, so a
-      // rare race that let two land here never fires two Claude calls at once.
-      for (const message of drained) {
-        const result = await processProactiveMessage(message, {
-          callRuntime: (prompt) => this.runtimeAdapter.sendSingleTurn({ text: prompt, resultSchema: PROACTIVE_RESULT_JSON_SCHEMA }),
-          // Task #12 round 2: ask Morrow's loopback relay for a fresh
-          // Accessibility read. The relay emits context_request on the same
-          // authenticated Clawd SSE and waits for Clawd's filtered response;
-          // it never writes a Supabase state row or polls companion_events.
-          fetchRefreshedContext: async () => {
-            const requestId = crypto.randomUUID();
-            return this.morrowContextRelay.requestContext({
-              requestId,
-              timeoutMs: this.config.contextSnapshotTimeoutMs,
-            });
-          },
-          sendMessage: (text) => this.channelAdapter.sendText({ userId: allowedSenderId, text }).then(() => true).catch((error) => {
-            console.error(`[cyberboss] proactive send failed: ${formatErrorMessage(error)}`);
-            return false;
-          }),
-          markAgentMessageSent: (nowIso) => {
-            const state = this.currentStateStore.load();
-            this.currentStateStore.save(this.currentStateStore.applyPatch(state, {}, { lastAgentMessageAt: nowIso }));
-          },
-          onLog: (msg) => console.log(`[cyberboss] ${msg}`),
-        });
-        results.push(result);
-        // Spec §7 posture carried over: never log message bodies, only metadata.
-        console.log(JSON.stringify({ mode: "proactive_turn", source: message.source, action: result.action, sent: result.sent }));
+      reservation = this.proactiveBudgetStore.reserveCall({ forced, nowMs: Date.now() });
+      if (!reservation.allowed) {
+        if (reservation.reason === "budget_exhausted" || reservation.reason === "mandatory_budget_reserved") {
+          this.proactiveBudgetStore.recordMetric("budgetBlocked");
+        }
+        return { drained: false, reason: reservation.reason };
       }
-      return { drained: true, results };
+
+      const bundle = await this.observationBundleBuilder.build();
+      const freshContext = await this.requestFreshProactiveContext();
+      const prompt = require("./proactive-turn-builder").buildProactiveTurnPrompt(bundle, {
+        freshContext,
+        forced,
+        candidate: message,
+      });
+      // Keep the candidate on disk until all pre-runtime preparation has
+      // succeeded. If local preparation fails, the reservation is rolled
+      // back and the candidate can be retried on the next pulse.
+      this.systemMessageQueueStore.save(this.systemMessageQueueStore.takeFirst(currentQueueState).state);
+      const result = await processProactiveMessage({ ...message, bundle, freshContext }, {
+        prompt,
+        callRuntime: (text) => {
+          runtimeStarted = true;
+          return this.runtimeAdapter.sendSingleTurn({
+            text,
+            resultSchema: forced ? MANDATORY_PROACTIVE_RESULT_JSON_SCHEMA : PROACTIVE_RESULT_JSON_SCHEMA,
+          });
+        },
+        sendMessage: (text) => this.channelAdapter.sendText({ userId: allowedSenderId, text }).then(() => true).catch((error) => {
+          console.error(`[cyberboss] proactive send failed: ${formatErrorMessage(error)}`);
+          return false;
+        }),
+        markAgentMessageSent: (nowIso) => this.markAgentMessageSent(nowIso),
+        onDeliveryFailed: (text) => {
+          if (forced && message.slotId) this.proactiveBudgetStore.recordDeliveryFailure(message.slotId, text);
+        },
+        onLog: (msg) => console.log(`[cyberboss] ${msg}`),
+      });
+
+      if (result.sent) {
+        if (forced && message.slotId) {
+          this.proactiveBudgetStore.markSlotSatisfied(message.slotId);
+        } else if (!forced) {
+          this.proactiveBudgetStore.markOptionalMessageSent();
+        }
+      } else if (!forced && result.action === "silent") {
+        this.proactiveBudgetStore.recordMetric("silentDecisions");
+      }
+      console.log(JSON.stringify({ mode: "proactive_turn", source: message.source, action: result.action, sent: result.sent }));
+      return { drained: true, results: [result] };
+    } catch (error) {
+      if (reservation?.reserved && !runtimeStarted) {
+        this.proactiveBudgetStore.releaseCallReservation(reservation);
+      }
+      throw error;
     } finally {
       await lock.release();
+    }
+  }
+
+  async requestFreshProactiveContext() {
+    try {
+      const requestId = crypto.randomUUID();
+      const context = await this.morrowContextRelay.requestContext({
+        requestId,
+        timeoutMs: this.config.contextSnapshotTimeoutMs,
+      });
+      if (context?.detail?.filtered) {
+        this.proactiveBudgetStore.recordMetric("contextRefreshFiltered");
+        console.log("[cyberboss] fresh context filtered");
+      } else {
+        this.proactiveBudgetStore.recordMetric("contextRefreshSuccess");
+        console.log("[cyberboss] fresh context ok");
+      }
+      return context;
+    } catch (error) {
+      const message = formatErrorMessage(error);
+      if (/timed out|timeout|abort/i.test(message)) {
+        this.proactiveBudgetStore.recordMetric("contextRefreshTimeout");
+        console.log("[cyberboss] fresh context timeout");
+      } else {
+        console.log(`[cyberboss] fresh context unavailable: ${message}`);
+      }
+      return { error: message };
     }
   }
 
@@ -337,6 +474,9 @@ class CyberbossApp {
       this.episodeStore.ensureCurrent(new Date().toISOString());
       this.memoryStore.load();
       this.intentionsStore.load();
+      this.systemMessageQueueStore.load();
+      this.eventOpportunityStateStore.load();
+      this.proactiveBudgetStore.load();
     } catch (error) {
       if (error instanceof StateCorruptionError) {
         console.error(`[cyberboss] FATAL: ${error.message}`);
@@ -683,6 +823,19 @@ function redactId(value) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getForcedEligibility(state, nowMs, budgetStore) {
+  if (state.totalCalls >= budgetStore.maxCallsPerDay) {
+    return { allowed: false, reason: "budget_exhausted" };
+  }
+  if (state.lastCallAt) {
+    const lastCallMs = new Date(state.lastCallAt).getTime();
+    if (Number.isFinite(lastCallMs) && nowMs - lastCallMs < budgetStore.minCallGapMs) {
+      return { allowed: false, reason: "call_gap" };
+    }
+  }
+  return { allowed: true, reason: null };
 }
 
 module.exports = { CyberbossApp, buildIntentionMessageText };

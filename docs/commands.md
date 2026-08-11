@@ -35,7 +35,6 @@ The runtime can be `codex` or `claudecode`, but the documented command surface s
 - `thread.compact`
 - `thread.switch`
 - `thread.stop`
-- `system.checkin_range`
 - `channel.chunk_min`
 
 ### Approvals & Control
@@ -98,7 +97,6 @@ Notes:
 - `/compact`
 - `/stop`
 - `/switch <threadId>`
-- `/checkin <min>-<max>`
 - `/chunk <number>`
 - `/yes`
 - `/always`

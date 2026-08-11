@@ -1,44 +1,17 @@
-// Event Opportunity (task #13): a low-frequency (~5min, config.eventOpportunityIntervalMs)
-// poll that decides whether the *current* observation bundle differs enough
-// from what was last seen to be worth queuing a proactive turn over — as
-// opposed to Stochastic Pulse (task #9-11), which fires on a random interval
-// regardless of content. Both end up in the same system-message-queue-store
-// (source differs: "event_opportunity" vs "stochastic_pulse"), both never
-// call Claude themselves — this module doesn't either, it's pure comparison
-// logic with no I/O, same shape as observation-bundle.js being separate from
-// system-checkin-poller.js.
-//
-// Delta signals (vv's spec, this session): new context / long silence / open
-// loop change / environment change. Deliberately no Supabase Realtime (vv's
-// call, this session) — this is a poll-and-diff, not a subscription.
-//
-// Dedupe vs cooldown are two separate mechanisms and both matter:
-//   - Dedupe (snapshot comparison): a signal only counts as "new" if the
-//     relevant field actually changed since the last *observed* snapshot
-//     (persisted every tick regardless of whether that tick fired) — so a
-//     value that changed once and then holds steady never re-fires. This is
-//     what stops "long silence" from firing every single tick forever once
-//     the threshold is first crossed: `longSilenceActive` is a derived
-//     boolean, not the raw elapsed time, so it only edges true->false->true,
-//     never re-fires while the user just stays quiet.
-//   - Cooldown (lastFiredAt): a blanket minimum gap between any two firings,
-//     independent of which signal caused them — a safety net against
-//     multiple distinct real deltas landing close together, not the primary
-//     anti-spam mechanism (dedupe is).
+const EVIDENCE_TTL_MS = 30 * 60 * 1000;
+const EVIDENCE_WEIGHTS = Object.freeze({
+  open_loop_change: 3,
+  new_context: 2,
+  long_silence: 2,
+  environment_change: 1,
+});
+const CANDIDATE_THRESHOLD = 3;
 
 function buildSnapshot(bundle, { now, longSilenceMs }) {
   const segments = Array.isArray(bundle?.companionSegments) ? bundle.companionSegments : [];
   const latestSegmentStartTs = segments[0]?.start_ts || null;
-
-  const openLoopsKey = JSON.stringify(Array.isArray(bundle?.openLoops) ? bundle.openLoops : []);
-
   const activity = bundle?.taskerSnapshot?.activity || null;
   const health = bundle?.taskerSnapshot?.health || null;
-  const environmentKey = JSON.stringify({
-    currentApp: activity?.current_app ?? null,
-    locationStatus: health?.location_status ?? null,
-  });
-
   const lastUserMessageAt = bundle?.currentState?.lastUserMessageAt || null;
   const elapsedSinceUserMs = lastUserMessageAt ? now - new Date(lastUserMessageAt).getTime() : null;
   const longSilenceActive = typeof elapsedSinceUserMs === "number" && Number.isFinite(elapsedSinceUserMs)
@@ -47,52 +20,154 @@ function buildSnapshot(bundle, { now, longSilenceMs }) {
 
   return {
     latestSegmentStartTs,
-    openLoopsKey,
-    environmentKey,
+    openLoopsKey: JSON.stringify(Array.isArray(bundle?.openLoops) ? bundle.openLoops : []),
+    currentApp: activity?.current_app ?? null,
+    locationStatus: health?.location_status ?? null,
     lastUserMessageAt,
     longSilenceActive,
   };
 }
 
-function diffReasons(previousSnapshot, currentSnapshot) {
+function oldEnvironmentParts(snapshot) {
+  if (snapshot && (Object.prototype.hasOwnProperty.call(snapshot, "currentApp")
+      || Object.prototype.hasOwnProperty.call(snapshot, "locationStatus"))) {
+    return {
+      currentApp: snapshot.currentApp ?? null,
+      locationStatus: snapshot.locationStatus ?? null,
+    };
+  }
+  try {
+    const parsed = JSON.parse(snapshot?.environmentKey || "{}");
+    return {
+      currentApp: parsed.currentApp ?? null,
+      locationStatus: parsed.locationStatus ?? null,
+    };
+  } catch {
+    return { currentApp: null, locationStatus: null };
+  }
+}
+
+function diffObservation(previousSnapshot, currentSnapshot, pendingEnvironment) {
   const reasons = [];
   if (!previousSnapshot) {
-    // First observation ever (fresh state / first boot) — nothing to diff
-    // against, so nothing is "new" yet. Just establish the baseline.
-    return reasons;
+    return { reasons, nextPendingEnvironment: null };
   }
-  if (currentSnapshot.latestSegmentStartTs && currentSnapshot.latestSegmentStartTs !== previousSnapshot.latestSegmentStartTs) {
+
+  if (currentSnapshot.latestSegmentStartTs
+      && currentSnapshot.latestSegmentStartTs !== previousSnapshot.latestSegmentStartTs) {
     reasons.push("new_context");
   }
   if (currentSnapshot.openLoopsKey !== previousSnapshot.openLoopsKey) {
     reasons.push("open_loop_change");
   }
-  if (currentSnapshot.environmentKey !== previousSnapshot.environmentKey) {
+
+  const previousEnvironment = oldEnvironmentParts(previousSnapshot);
+  if (currentSnapshot.locationStatus !== previousEnvironment.locationStatus) {
     reasons.push("environment_change");
   }
+
+  let nextPendingEnvironment = null;
+  if (currentSnapshot.currentApp !== previousEnvironment.currentApp) {
+    if (pendingEnvironment?.key === currentSnapshot.currentApp) {
+      const count = Number(pendingEnvironment.count) + 1;
+      if (count >= 2) {
+        reasons.push("environment_change");
+      } else {
+        nextPendingEnvironment = { key: currentSnapshot.currentApp, count };
+      }
+    } else {
+      nextPendingEnvironment = { key: currentSnapshot.currentApp, count: 1 };
+    }
+  } else if (pendingEnvironment?.key === currentSnapshot.currentApp) {
+    // The first changed-app sample is already in the previous snapshot. A
+    // second identical poll is stable even though the raw snapshot advanced.
+    const count = Number(pendingEnvironment.count) + 1;
+    if (count >= 2) {
+      reasons.push("environment_change");
+    } else {
+      nextPendingEnvironment = { key: currentSnapshot.currentApp, count };
+    }
+  }
+
   if (currentSnapshot.longSilenceActive && !previousSnapshot.longSilenceActive) {
     reasons.push("long_silence");
   }
-  return reasons;
+  return { reasons: [...new Set(reasons)], nextPendingEnvironment };
 }
 
-// bundle: observation-bundle.js's build() output. previous: { snapshot, lastFiredAt }
-// as persisted by event-opportunity-state-store.js (either field may be null).
-function evaluateOpportunity({ bundle, previous, now = Date.now(), cooldownMs, longSilenceMs }) {
-  const currentSnapshot = buildSnapshot(bundle, { now, longSilenceMs });
-  const reasons = diffReasons(previous?.snapshot || null, currentSnapshot);
+function pruneEvidence(evidence, now, ttlMs) {
+  if (!Array.isArray(evidence)) return [];
+  return evidence.filter((item) => {
+    const timestamp = new Date(item?.observedAt).getTime();
+    return item && EVIDENCE_WEIGHTS[item.type] && Number.isFinite(timestamp) && now - timestamp <= ttlMs;
+  }).map((item) => ({
+    type: item.type,
+    observedAt: item.observedAt,
+    score: EVIDENCE_WEIGHTS[item.type],
+  }));
+}
 
-  const cooldownActive = Boolean(previous?.lastFiredAt) && (now - new Date(previous.lastFiredAt).getTime()) < cooldownMs;
-  const worth = reasons.length > 0 && !cooldownActive;
+function scoreEvidence(evidence) {
+  return evidence.reduce((total, item) => total + (EVIDENCE_WEIGHTS[item.type] || 0), 0);
+}
+
+function evaluateEvidence({
+  bundle,
+  previous,
+  now = Date.now(),
+  longSilenceMs,
+  evidenceTtlMs = EVIDENCE_TTL_MS,
+}) {
+  const currentSnapshot = buildSnapshot(bundle, { now, longSilenceMs });
+  const previousSnapshot = previous?.snapshot || null;
+  const { reasons, nextPendingEnvironment } = diffObservation(
+    previousSnapshot,
+    currentSnapshot,
+    previous?.pendingEnvironment || null,
+  );
+  const evidence = [
+    ...pruneEvidence(previous?.evidence, now, evidenceTtlMs),
+    ...reasons.map((type) => ({
+      type,
+      observedAt: new Date(now).toISOString(),
+      score: EVIDENCE_WEIGHTS[type],
+    })),
+  ];
+  const evidenceScore = scoreEvidence(evidence);
+  let candidate = null;
+  if (evidenceScore >= CANDIDATE_THRESHOLD) {
+    const priorCandidate = previous?.candidate && typeof previous.candidate === "object"
+      ? previous.candidate
+      : null;
+    candidate = {
+      id: priorCandidate?.id || null,
+      createdAt: priorCandidate?.createdAt || new Date(now).toISOString(),
+      reasons: [...new Set(evidence.map((item) => item.type))],
+      evidenceScore,
+    };
+  }
 
   return {
-    worth,
     reasons,
-    cooldownActive,
-    // Always advance the observed snapshot, whether or not this tick fired —
-    // this is what makes dedupe work (see module comment).
+    evidence,
+    evidenceScore,
+    candidate,
     nextSnapshot: currentSnapshot,
+    nextPendingEnvironment,
   };
 }
 
-module.exports = { buildSnapshot, diffReasons, evaluateOpportunity };
+// Kept as a small compatibility export for callers/tests that only need the
+// raw signal names. Candidate gating uses evaluateEvidence above.
+function diffReasons(previousSnapshot, currentSnapshot) {
+  return diffObservation(previousSnapshot, currentSnapshot, null).reasons;
+}
+
+module.exports = {
+  buildSnapshot,
+  diffReasons,
+  evaluateEvidence,
+  EVIDENCE_TTL_MS,
+  EVIDENCE_WEIGHTS,
+  CANDIDATE_THRESHOLD,
+};

@@ -1,7 +1,7 @@
 // Assembles what a proactive turn is allowed to see: current state + open
 // loops + core memory (all local, from the same stores a normal turn already
 // reads) plus Tasker's snapshot and keke-overflow's recent companion segments
-// (both remote, via src/adapters/observation/*). Shared between Stochastic
+// (both remote, via src/adapters/observation/*). Shared between proactive
 // Pulse (this session) and Event Opportunity (session 4) — both need the same
 // bundle shape, just triggered on a different schedule.
 //

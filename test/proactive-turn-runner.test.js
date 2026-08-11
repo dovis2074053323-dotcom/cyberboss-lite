@@ -6,8 +6,9 @@ const { processProactiveMessage } = require("../src/core/proactive-turn-runner")
 function baseMessage(overrides = {}) {
   return {
     id: "msg1",
-    source: "stochastic_pulse",
+    source: "event_opportunity",
     createdAt: new Date().toISOString(),
+    forced: false,
     bundle: { currentState: {}, openLoops: [], coreMemories: [] },
     ...overrides,
   };
@@ -15,168 +16,93 @@ function baseMessage(overrides = {}) {
 
 function stubs(overrides = {}) {
   return {
+    prompt: "prompt",
     callRuntime: async () => ({ structuredResult: { action: "silent", message: null, reason: "nothing going on" } }),
-    fetchRefreshedContext: async () => [],
     sendMessage: async () => true,
     markAgentMessageSent: () => {},
+    onDeliveryFailed: () => {},
     onLog: () => {},
     ...overrides,
   };
 }
 
-test("send_message: sends via sendMessage and marks lastAgentMessageAt without a Clawd side effect", async () => {
-  const sentTexts = [];
+test("optional send_message delivers and marks the confirmed outbound message", async () => {
+  const sent = [];
   const marked = [];
   const result = await processProactiveMessage(baseMessage(), stubs({
-    callRuntime: async () => ({ structuredResult: { action: "send_message", message: "在忙吗，想你了", reason: "quiet a while" } }),
-    sendMessage: async (text) => { sentTexts.push(text); return true; },
+    callRuntime: async () => ({ structuredResult: { action: "send_message", message: "在忙吗", reason: "quiet" } }),
+    sendMessage: async (text) => { sent.push(text); return true; },
     markAgentMessageSent: (nowIso) => marked.push(nowIso),
   }));
-
   assert.equal(result.action, "send_message");
   assert.equal(result.sent, true);
-  assert.deepEqual(sentTexts, ["在忙吗，想你了"]);
+  assert.deepEqual(sent, ["在忙吗"]);
   assert.equal(marked.length, 1);
 });
 
-test("send_message: sendMessage returning false skips lastAgentMessageAt", async () => {
-  const marked = [];
-  const result = await processProactiveMessage(baseMessage(), stubs({
-    callRuntime: async () => ({ structuredResult: { action: "send_message", message: "hi", reason: "r" } }),
-    sendMessage: async () => false,
-    markAgentMessageSent: (nowIso) => marked.push(nowIso),
-  }));
-
-  assert.equal(result.sent, false);
-  assert.equal(marked.length, 0);
-});
-
-test("send_message: sendMessage throwing is treated as not-sent, not a crash", async () => {
-  const result = await processProactiveMessage(baseMessage(), stubs({
-    callRuntime: async () => ({ structuredResult: { action: "send_message", message: "hi", reason: "r" } }),
-    sendMessage: async () => { throw new Error("weixin down"); },
-  }));
-  assert.equal(result.sent, false);
-});
-
-test("silent: no sendMessage/markAgentMessageSent calls", async () => {
+test("optional silent has no delivery side effect", async () => {
   let sendCalled = false;
-  let markCalled = false;
   const result = await processProactiveMessage(baseMessage(), stubs({
-    callRuntime: async () => ({ structuredResult: { action: "silent", message: null, reason: "quiet" } }),
     sendMessage: async () => { sendCalled = true; return true; },
-    markAgentMessageSent: () => { markCalled = true; },
   }));
   assert.equal(result.action, "silent");
   assert.equal(sendCalled, false);
-  assert.equal(markCalled, false);
 });
 
-test("defer: no side effects, distinct action from silent", async () => {
-  const result = await processProactiveMessage(baseMessage(), stubs({
-    callRuntime: async () => ({ structuredResult: { action: "defer", message: null, reason: "not enough signal" } }),
-  }));
-  assert.equal(result.action, "defer");
-});
-
-test("need_context: fetches refreshed Accessibility context and runs a real round 2, applying its decision", async () => {
-  const prompts = [];
-  const fetchCalls = [];
-  const sent = [];
-  const result = await processProactiveMessage(baseMessage(), stubs({
-    callRuntime: async (prompt) => {
-      prompts.push(prompt);
-      if (prompts.length === 1) {
-        return { structuredResult: { action: "need_context", message: null, reason: "not enough signal yet" } };
-      }
-      return { structuredResult: { action: "send_message", message: "在忙嘛", reason: "now I know" } };
-    },
-    fetchRefreshedContext: async () => {
-      fetchCalls.push(true);
-      return { created_at: "2026-08-09T12:00:00Z", detail: { package: "com.android.chrome", activity: "MainActivity" } };
-    },
-    sendMessage: async (text) => { sent.push(text); return true; },
-  }));
-
-  assert.equal(fetchCalls.length, 1);
-  assert.equal(prompts.length, 2);
-  assert.doesNotMatch(prompts[0], /Refreshed Accessibility context/);
-  assert.match(prompts[1], /Refreshed Accessibility context/);
-  assert.match(prompts[1], /com\.android\.chrome/);
-  assert.equal(result.action, "send_message");
-  assert.deepEqual(sent, ["在忙嘛"]);
-});
-
-test("need_context: fetchRefreshedContext throwing still proceeds to round 2 with an error marker, doesn't crash", async () => {
-  const prompts = [];
-  const result = await processProactiveMessage(baseMessage(), stubs({
-    callRuntime: async (prompt) => {
-      prompts.push(prompt);
-      return prompts.length === 1
-        ? { structuredResult: { action: "need_context", message: null, reason: "r" } }
-        : { structuredResult: { action: "silent", message: null, reason: "still nothing after refresh" } };
-    },
-    fetchRefreshedContext: async () => { throw new Error("Morrow context relay unavailable"); },
-  }));
-
-  assert.equal(prompts.length, 2);
-  assert.match(prompts[1], /Refreshed Accessibility context: \(unavailable — Morrow context relay unavailable\)/);
-  assert.equal(result.action, "silent");
-});
-
-test("need_context: device responded but its own privacy filter withheld the content — a real answer, not a timeout", async () => {
-  const prompts = [];
-  const result = await processProactiveMessage(baseMessage(), stubs({
-    callRuntime: async (prompt) => {
-      prompts.push(prompt);
-      return prompts.length === 1
-        ? { structuredResult: { action: "need_context", message: null, reason: "r" } }
-        : { structuredResult: { action: "silent", message: null, reason: "can't tell, respecting the filter" } };
-    },
-    fetchRefreshedContext: async () => ({
-      created_at: "2026-08-09T12:00:00Z",
-      detail: { requestId: "r1", package: "com.tencent.mm", filtered: true, filterReason: "no_text_extraction_package" },
-    }),
-  }));
-
-  assert.equal(prompts.length, 2);
-  assert.match(prompts[1], /device looked, but withheld it — no_text_extraction_package/);
-  assert.equal(result.action, "silent");
-});
-
-test("need_context repeated on round 2 is capped, not a third round — falls back to silent", async () => {
-  let callCount = 0;
+test("need_context and defer are invalid optional contracts and cannot create a second call", async () => {
+  let calls = 0;
   const result = await processProactiveMessage(baseMessage(), stubs({
     callRuntime: async () => {
-      callCount += 1;
-      return { structuredResult: { action: "need_context", message: null, reason: "still not enough" } };
+      calls += 1;
+      return { structuredResult: { action: "need_context", message: null, reason: "not allowed" } };
     },
   }));
-
-  assert.equal(callCount, 2, "应该恰好两轮，不应该有第三轮");
-  assert.equal(result.action, "silent");
-  assert.match(result.reason, /two-round cap/);
-});
-
-test("runtime throwing falls back to silent, never crashes the drain", async () => {
-  const result = await processProactiveMessage(baseMessage(), stubs({
-    callRuntime: async () => { throw new Error("claude exited with code 1"); },
-  }));
-  assert.equal(result.action, "silent");
-  assert.match(result.reason, /runtime_error/);
-});
-
-test("malformed structured result falls back to silent, never forwards a possibly-bad message", async () => {
-  const result = await processProactiveMessage(baseMessage(), stubs({
-    callRuntime: async () => ({ structuredResult: { action: "send_message", message: null } }), // send_message requires non-empty message
-  }));
+  assert.equal(calls, 1);
   assert.equal(result.action, "silent");
   assert.match(result.reason, /invalid_result/);
 });
 
-test("null structuredResult (CLI gave nothing usable) falls back to silent", async () => {
-  const result = await processProactiveMessage(baseMessage(), stubs({
-    callRuntime: async () => ({ structuredResult: null }),
+test("mandatory contract makes one delivery attempt and never accepts silent", async () => {
+  const sent = [];
+  const result = await processProactiveMessage(baseMessage({ forced: true, source: "mandatory_slot", slotId: "morning" }), stubs({
+    callRuntime: async () => ({ structuredResult: { message: "想起你了", reason: "a brief thought" } }),
+    sendMessage: async (text) => { sent.push(text); return true; },
   }));
+  assert.equal(result.action, "send_message");
+  assert.equal(result.sent, true);
+  assert.deepEqual(sent, ["想起你了"]);
+});
+
+test("mandatory empty message is rejected without another runtime call", async () => {
+  let calls = 0;
+  const result = await processProactiveMessage(baseMessage({ forced: true, source: "mandatory_slot" }), stubs({
+    callRuntime: async () => {
+      calls += 1;
+      return { structuredResult: { message: "", reason: "bad" } };
+    },
+  }));
+  assert.equal(calls, 1);
+  assert.equal(result.action, "mandatory_failed");
+  assert.equal(result.sent, false);
+});
+
+test("mandatory delivery failure hands the generated text to a pure retry hook", async () => {
+  let retryText = null;
+  const result = await processProactiveMessage(baseMessage({ forced: true, source: "mandatory_slot" }), stubs({
+    callRuntime: async () => ({ structuredResult: { message: "我来啦", reason: "check in" } }),
+    sendMessage: async () => false,
+    onDeliveryFailed: (text) => { retryText = text; },
+  }));
+  assert.equal(result.sent, false);
+  assert.equal(retryText, "我来啦");
+});
+
+test("runtime error is one failed call, not a retry loop", async () => {
+  let calls = 0;
+  const result = await processProactiveMessage(baseMessage(), stubs({
+    callRuntime: async () => { calls += 1; throw new Error("claude exited"); },
+  }));
+  assert.equal(calls, 1);
   assert.equal(result.action, "silent");
+  assert.match(result.reason, /runtime_error/);
 });

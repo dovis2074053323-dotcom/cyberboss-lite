@@ -1,15 +1,18 @@
 const { readJsonStore, writeJsonStoreAtomic } = require("./json-store");
 
-// Persists what Event Opportunity last saw, across ticks and restarts —
-// without this, every process restart would treat the first post-restart
-// bundle as "all new" and fire immediately. Same atomic-JSON pattern as
-// checkin-config-store.js. `snapshot` is event-opportunity-detector.js's
-// comparison fingerprint (opaque here); `lastFiredAt` is only used for the
-// blanket cooldown, not for per-signal dedupe (that's snapshot's job — see
-// the detector's module comment for why the two are separate mechanisms).
+// Persists the observation fingerprint plus the rolling local evidence
+// accumulator. Keeping both in this existing state file means a restart does
+// not turn the first post-restart poll into a fake event, and no parallel
+// observation store is introduced for proactive scheduling.
 
 function defaultState() {
-  return { snapshot: null, lastFiredAt: null };
+  return {
+    snapshot: null,
+    lastFiredAt: null,
+    evidence: [],
+    pendingEnvironment: null,
+    candidate: null,
+  };
 }
 
 function createEventOpportunityStateStore(config) {
@@ -18,7 +21,15 @@ function createEventOpportunityStateStore(config) {
   function load() {
     const raw = readJsonStore(filePath, defaultState);
     const { schemaVersion, updatedAt, ...rest } = raw;
-    return { ...defaultState(), ...rest };
+    return {
+      ...defaultState(),
+      ...rest,
+      evidence: Array.isArray(rest.evidence) ? rest.evidence : [],
+      pendingEnvironment: rest.pendingEnvironment && typeof rest.pendingEnvironment === "object"
+        ? rest.pendingEnvironment
+        : null,
+      candidate: rest.candidate && typeof rest.candidate === "object" ? rest.candidate : null,
+    };
   }
 
   function save(state) {

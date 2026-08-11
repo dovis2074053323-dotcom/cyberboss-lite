@@ -1,52 +1,29 @@
-// Decision 5 (Cyberboss Proactive + keke-overflow Companion Rework, this
-// session): the proactive turn (Stochastic Pulse / Event Opportunity wake-ups)
-// does NOT reuse the full normal-turn contract in result-schema.js. That
-// contract lets a turn touch memory/loops/intentions — deliberately withheld
-// here. A proactive turn is a system-initiated "is this worth a look" check,
-// not a real conversational turn; letting it also write long-term memory or
-// open loops would mean a wake-up nobody asked for could quietly reshape
-// state the same way a real exchange with the user does. If a proactive turn
-// decides something is worth remembering, it has exactly one lever: send a
-// message and let the user's own reply (a real turn) carry that through the
-// normal contract.
-//
-// Four actions, no free-form JSON, no template pool:
-//   - send_message: `message` is what actually goes to the user, written by
-//     the model in this same call, not looked up from a table.
-//   - silent: a real decision — evaluated the observation, decided not to
-//     reach out this time.
-//   - need_context: the observation bundle isn't enough to decide; ask for a
-//     fresher, fuller on-demand Accessibility read before deciding (session 4's
-//     two-turn relay — see proactive-turn-runner.js's round-2 handling). This
-//     is deliberately NOT a screenshot/Vision request: task #12 (this
-//     session) chose "refresh the existing text-only Accessibility signal on
-//     demand" over building real screenshot capture/upload infrastructure —
-//     keke-overflow's cc-clawd-overhaul.md 阶段三 privacy stance ("不存截图
-//     原图") stays intact. Real screenshot + Vision captioning is recorded as
-//     a future enhancement, to revisit once this text-only relay has real
-//     usage to learn from.
-//   - defer: not enough signal to decide either way right now, try again
-///    later. Distinct from `silent` (silent = decided against it; defer =
-//     didn't decide).
+// Proactive turns are intentionally narrower than a normal WeChat turn: they
+// cannot mutate memory, loops, intentions, or any other durable relationship
+// state. Optional turns choose send_message or silent in one call. Mandatory
+// slots receive a separate contract that has no silent branch.
 
-const ACTIONS = ["send_message", "silent", "need_context", "defer"];
-
-const LIMITS = {
-  messageMaxChars: 600,
-  reasonMaxChars: 200,
-};
+const ACTIONS = ["send_message", "silent"];
+const LIMITS = { messageMaxChars: 600, reasonMaxChars: 200 };
 
 const PROACTIVE_RESULT_JSON_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["action", "message"],
+  required: ["action", "message", "reason"],
   properties: {
     action: { type: "string", enum: ACTIONS },
     message: { type: ["string", "null"], maxLength: LIMITS.messageMaxChars },
-    // Internal-only, never sent to the user — why this decision, for logs.
-    // Same non-sent-to-user posture as intentions.create[].reason in
-    // result-schema.js.
-    reason: { type: ["string", "null"], maxLength: LIMITS.reasonMaxChars },
+    reason: { type: "string", maxLength: LIMITS.reasonMaxChars },
+  },
+};
+
+const MANDATORY_PROACTIVE_RESULT_JSON_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["message", "reason"],
+  properties: {
+    message: { type: "string", minLength: 1, maxLength: LIMITS.messageMaxChars },
+    reason: { type: "string", maxLength: LIMITS.reasonMaxChars },
   },
 };
 
@@ -54,69 +31,60 @@ function isPlainObject(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-// Single-stage validation (unlike result-schema.js's two-stage design): there
-// are no nested per-item arrays here to partially salvage, so any structural
-// problem invalidates the whole candidate. The caller's fallback on a fatal
-// result must always be `{ action: "silent" }` — never fall back to
-// forwarding a possibly-malformed `message`.
+function validateReason(candidate, errors) {
+  if (typeof candidate.reason !== "string") {
+    errors.push("reason must be a string");
+  } else if (candidate.reason.length > LIMITS.reasonMaxChars) {
+    errors.push(`reason exceeds max length ${LIMITS.reasonMaxChars}`);
+  }
+}
+
 function evaluateProactiveResult(candidate) {
   const errors = [];
-
-  if (!isPlainObject(candidate)) {
-    return { fatal: true, errors: ["result must be an object"] };
-  }
-
-  const allowedKeys = new Set(["action", "message", "reason"]);
+  if (!isPlainObject(candidate)) return { fatal: true, errors: ["result must be an object"] };
   for (const key of Object.keys(candidate)) {
-    if (!allowedKeys.has(key)) {
-      errors.push(`unknown top-level field "${key}"`);
-    }
+    if (!["action", "message", "reason"].includes(key)) errors.push(`unknown top-level field "${key}"`);
   }
-  if (!ACTIONS.includes(candidate.action)) {
-    errors.push(`action must be one of ${ACTIONS.join(", ")}`);
-  }
+  if (!ACTIONS.includes(candidate.action)) errors.push(`action must be one of ${ACTIONS.join(", ")}`);
 
   const message = candidate.message;
-  if (message !== null && message !== undefined && typeof message !== "string") {
+  if (message !== null && typeof message !== "string") {
     errors.push("message must be a string or null");
   } else if (typeof message === "string" && message.length > LIMITS.messageMaxChars) {
     errors.push(`message exceeds max length ${LIMITS.messageMaxChars}`);
   }
-
-  // send_message without real text is not a usable decision — treat it as
-  // fatal (fall back to silent) rather than silently sending an empty bubble.
   if (candidate.action === "send_message" && !(typeof message === "string" && message.trim())) {
     errors.push("action=send_message requires a non-empty message");
   }
-  // The other three actions must not carry a message — a model that fills
-  // `message` while saying `silent` is a contract violation worth rejecting,
-  // not worth guessing about which field the caller meant.
-  if (candidate.action !== "send_message" && typeof message === "string" && message.trim()) {
-    errors.push(`action=${candidate.action} must not include a message`);
+  if (candidate.action === "silent" && typeof message === "string" && message.trim()) {
+    errors.push("action=silent must not include a message");
   }
+  validateReason(candidate, errors);
+  if (errors.length) return { fatal: true, errors };
+  return { fatal: false, action: candidate.action, message: candidate.action === "send_message" ? message : null, reason: candidate.reason };
+}
 
-  const reason = candidate.reason;
-  if (reason !== null && reason !== undefined && typeof reason !== "string") {
-    errors.push("reason must be a string or null");
-  } else if (typeof reason === "string" && reason.length > LIMITS.reasonMaxChars) {
-    errors.push(`reason exceeds max length ${LIMITS.reasonMaxChars}`);
+function evaluateMandatoryResult(candidate) {
+  const errors = [];
+  if (!isPlainObject(candidate)) return { fatal: true, errors: ["result must be an object"] };
+  for (const key of Object.keys(candidate)) {
+    if (!["message", "reason"].includes(key)) errors.push(`unknown top-level field "${key}"`);
   }
-
-  if (errors.length) {
-    return { fatal: true, errors };
+  if (!(typeof candidate.message === "string" && candidate.message.trim())) {
+    errors.push("mandatory message must be non-empty");
+  } else if (candidate.message.length > LIMITS.messageMaxChars) {
+    errors.push(`message exceeds max length ${LIMITS.messageMaxChars}`);
   }
-
-  return {
-    fatal: false,
-    action: candidate.action,
-    message: candidate.action === "send_message" ? message : null,
-    reason: typeof reason === "string" ? reason : null,
-  };
+  validateReason(candidate, errors);
+  if (errors.length) return { fatal: true, errors };
+  return { fatal: false, message: candidate.message, reason: candidate.reason };
 }
 
 module.exports = {
   PROACTIVE_RESULT_JSON_SCHEMA,
+  MANDATORY_PROACTIVE_RESULT_JSON_SCHEMA,
   ACTIONS,
   LIMITS,
   evaluateProactiveResult,
+  evaluateMandatoryResult,
 };

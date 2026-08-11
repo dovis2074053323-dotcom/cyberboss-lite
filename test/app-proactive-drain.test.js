@@ -1,11 +1,3 @@
-// Task #14: runProactiveDrainTick drains system-message-queue-store (populated
-// by Stochastic Pulse / Event Opportunity, tested separately in
-// test/system-checkin-poller.test.js and test/event-opportunity-poller.test.js)
-// and runs exactly one real proactive Claude turn per queued message. These
-// tests exercise it directly (not through the 60s Pulse timer) with a real
-// host-lock (flock is available in this environment, same as
-// test/host-lock.test.js) and stubbed runtime/channel adapters — no real
-// Claude process or WeChat account involved.
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
@@ -16,153 +8,245 @@ function enqueueOne(app, overrides = {}) {
   const state = app.systemMessageQueueStore.load();
   const next = app.systemMessageQueueStore.enqueue(state, {
     id: "msg1",
-    source: "stochastic_pulse",
+    source: "event_opportunity",
     createdAt: new Date().toISOString(),
-    bundle: { currentState: {}, openLoops: [], coreMemories: [] },
+    forced: false,
+    reasons: ["open_loop_change"],
+    evidenceScore: 3,
     ...overrides,
   });
   app.systemMessageQueueStore.save(next);
 }
 
-test("empty queue: returns reason=empty, never touches runtime or channel", async () => {
+function useFreshContext(app, value = { created_at: "2026-08-11T12:00:00Z", detail: { package: "com.android.chrome" } }) {
+  app.morrowContextRelay.requestContext = async () => value;
+}
+
+function makeDueSlot(app, nowMs = Date.now(), slotId = "morning") {
+  const state = app.proactiveBudgetStore.load(nowMs);
+  const slots = state.slots.map((slot) => slot.id === slotId
+    ? {
+      ...slot,
+      startAt: new Date(nowMs - 60_000).toISOString(),
+      targetAt: new Date(nowMs - 1_000).toISOString(),
+      endAt: new Date(nowMs + 60 * 60_000).toISOString(),
+    }
+    : slot);
+  app.proactiveBudgetStore.save({ ...state, slots });
+}
+
+test("empty queue: never touches runtime or channel", async () => {
   const app = buildApp({ allowedSenderId: "user1" });
   let runtimeCalled = false;
-  let sendCalled = false;
-  app.runtimeAdapter.sendSingleTurn = async () => { runtimeCalled = true; return { structuredResult: {} }; };
-  app.channelAdapter.sendText = async () => { sendCalled = true; };
+  app.runtimeAdapter.sendSingleTurn = async () => { runtimeCalled = true; };
+  app.channelAdapter.sendText = async () => { throw new Error("must not send"); };
 
   const result = await app.runProactiveDrainTick();
-
-  assert.equal(result.drained, false);
   assert.equal(result.reason, "empty");
   assert.equal(runtimeCalled, false);
-  assert.equal(sendCalled, false);
 });
 
-test("no allowedSenderId yet: skips before touching the lock, message stays queued", async () => {
-  const app = buildApp(); // allowedSenderId defaults to ""
+test("no allowedSenderId leaves the candidate queued", async () => {
+  const app = buildApp();
   enqueueOne(app);
-
   const result = await app.runProactiveDrainTick();
-
-  assert.equal(result.drained, false);
   assert.equal(result.reason, "no_allowed_sender");
-  assert.equal(app.systemMessageQueueStore.load().messages.length, 1, "消息不应该被消费掉");
+  assert.equal(app.systemMessageQueueStore.load().messages.length, 1);
 });
 
-test("lock busy: skips, message stays queued for the next tick", async () => {
+test("host lock busy leaves the candidate queued and consumes no call", async () => {
   const app = buildApp({ allowedSenderId: "user1" });
   enqueueOne(app);
-
   const holder = await acquireHostLock({ lockDir: app.config.hostLockDir, kind: "test_hold", timeoutMs: 0 });
   try {
     const result = await app.runProactiveDrainTick();
-    assert.equal(result.drained, false);
     assert.equal(result.reason, "lock_busy");
     assert.equal(app.systemMessageQueueStore.load().messages.length, 1);
+    assert.equal(app.proactiveBudgetStore.load().totalCalls, 0);
   } finally {
     await holder.release();
   }
 });
 
-test("send_message end to end: WeChat send called, lastAgentMessageAt updated, queue drained without Clawd visual output", async () => {
+test("a different forced queue item prevents a second mandatory item", async () => {
   const app = buildApp({ allowedSenderId: "user1" });
-  enqueueOne(app);
+  const now = Date.now();
+  makeDueSlot(app, now, "morning");
+  const budget = app.proactiveBudgetStore.load(now);
+  app.proactiveBudgetStore.save({
+    ...budget,
+    slots: budget.slots.map((slot) => slot.id === "morning"
+      ? slot
+      : {
+        ...slot,
+        startAt: new Date(now + 60 * 60_000).toISOString(),
+        targetAt: new Date(now + 60 * 60_000).toISOString(),
+        endAt: new Date(now + 2 * 60 * 60_000).toISOString(),
+      }),
+  });
+  const state = app.systemMessageQueueStore.load();
+  app.systemMessageQueueStore.save(app.systemMessageQueueStore.enqueue(state, {
+    id: "afternoon-forced",
+    source: "mandatory_slot",
+    createdAt: new Date(now).toISOString(),
+    forced: true,
+    slotId: "afternoon",
+  }));
 
+  const result = await app.runMandatorySlotCheck(now);
+  assert.equal(result.reason, "queue_pending");
+  assert.equal(app.systemMessageQueueStore.load().messages.length, 1);
+});
+
+test("optional send rebuilds the latest bundle, refreshes Clawd once, and calls Claude once", async () => {
+  const app = buildApp({ allowedSenderId: "user1" });
+  enqueueOne(app, { bundle: { stale: true } });
+  app.observationBundleBuilder.build = async () => ({ currentState: { currentActivity: "latest" }, openLoops: [], coreMemories: [], taskerSnapshot: {}, companionSegments: [] });
+  useFreshContext(app);
+  const prompts = [];
   const sent = [];
   app.runtimeAdapter.sendSingleTurn = async ({ text, resultSchema }) => {
-    assert.ok(text.includes("SYSTEM ACTION MODE"), "应该用 proactive-turn-builder 渲染的 prompt");
-    assert.ok(resultSchema, "应该传入窄契约 schema，不是默认的 RESULT_JSON_SCHEMA");
-    return { structuredResult: { action: "send_message", message: "在干嘛呀", reason: "quiet a while" } };
+    prompts.push({ text, resultSchema });
+    return { structuredResult: { action: "send_message", message: "在呢", reason: "a real candidate" } };
   };
   app.channelAdapter.sendText = async ({ userId, text }) => { sent.push({ userId, text }); };
 
   const result = await app.runProactiveDrainTick();
-
-  assert.equal(result.drained, true);
-  assert.equal(result.results.length, 1);
-  assert.equal(result.results[0].action, "send_message");
   assert.equal(result.results[0].sent, true);
-  assert.deepEqual(sent, [{ userId: "user1", text: "在干嘛呀" }]);
-  assert.equal(app.systemMessageQueueStore.load().messages.length, 0);
-
-  const state = app.currentStateStore.load();
-  assert.ok(state.lastAgentMessageAt, "lastAgentMessageAt 应该被更新");
+  assert.equal(prompts.length, 1);
+  assert.match(prompts[0].text, /latest/);
+  assert.match(prompts[0].text, /Fresh Clawd Accessibility context/);
+  assert.equal(prompts[0].resultSchema.required.includes("action"), true);
+  assert.deepEqual(sent, [{ userId: "user1", text: "在呢" }]);
+  assert.equal(app.proactiveBudgetStore.load().totalCalls, 1);
 });
 
-test("need_context end to end: app.js asks the loopback Morrow relay with one requestId", async () => {
+test("a local preparation failure keeps the candidate and rolls back the reservation", async () => {
   const app = buildApp({ allowedSenderId: "user1" });
   enqueueOne(app);
+  useFreshContext(app);
+  app.observationBundleBuilder.build = async () => { throw new Error("local observation failure"); };
 
-  let calls = 0;
-  const prompts = [];
-  app.runtimeAdapter.sendSingleTurn = async ({ text }) => {
-    calls += 1;
-    prompts.push(text);
-    if (calls === 1) {
-      return { structuredResult: { action: "need_context", message: null, reason: "not enough" } };
-    }
-    return { structuredResult: { action: "silent", message: null, reason: "still nothing after refresh" } };
-  };
-  let requestedId = null;
-  app.morrowContextRelay.requestContext = async ({ requestId }) => {
-    requestedId = requestId;
-    return { created_at: "2026-08-11T12:00:00Z", detail: { requestId, package: "com.android.chrome" } };
-  };
-
-  const result = await app.runProactiveDrainTick();
-
-  assert.ok(requestedId, "应该真的经 Morrow relay 发出一个 requestId");
-  assert.equal(calls, 2);
-  assert.match(prompts[1], /Refreshed Accessibility context/);
-  assert.equal(result.results[0].action, "silent");
+  await assert.rejects(() => app.runProactiveDrainTick(), /local observation failure/);
+  assert.equal(app.systemMessageQueueStore.load().messages.length, 1);
+  assert.equal(app.proactiveBudgetStore.load().totalCalls, 0);
 });
 
-test("silent: no WeChat send or Clawd visual output, queue still drained", async () => {
+test("optional silent consumes one call but does not send", async () => {
   const app = buildApp({ allowedSenderId: "user1" });
   enqueueOne(app);
-
+  useFreshContext(app);
   let sendCalled = false;
-  app.runtimeAdapter.sendSingleTurn = async () => ({ structuredResult: { action: "silent", message: null, reason: "nothing new" } });
+  app.runtimeAdapter.sendSingleTurn = async () => ({ structuredResult: { action: "silent", message: null, reason: "not worth interrupting" } });
   app.channelAdapter.sendText = async () => { sendCalled = true; };
-
   const result = await app.runProactiveDrainTick();
-
   assert.equal(result.results[0].action, "silent");
   assert.equal(sendCalled, false);
-  assert.equal(app.systemMessageQueueStore.load().messages.length, 0);
+  assert.equal(app.proactiveBudgetStore.load().silentDecisions, 1);
+  assert.equal(app.proactiveBudgetStore.load().totalCalls, 1);
 });
 
-test("runtimeAdapter throwing degrades to silent, queue still drained (never stuck retrying the same message forever)", async () => {
+test("fresh context timeout still makes exactly one Claude call", async () => {
   const app = buildApp({ allowedSenderId: "user1" });
   enqueueOne(app);
-  app.runtimeAdapter.sendSingleTurn = async () => { throw new Error("claude exited with code 1"); };
-
+  app.morrowContextRelay.requestContext = async () => { throw new Error("Morrow context relay timed out after 15000ms"); };
+  let calls = 0;
+  let prompt = "";
+  app.runtimeAdapter.sendSingleTurn = async ({ text }) => {
+    calls += 1;
+    prompt = text;
+    return { structuredResult: { action: "silent", message: null, reason: "no fresh context" } };
+  };
   const result = await app.runProactiveDrainTick();
-
+  assert.equal(calls, 1);
   assert.equal(result.results[0].action, "silent");
+  assert.match(prompt, /Fresh Clawd Accessibility context: \(unavailable/);
+  assert.equal(app.proactiveBudgetStore.load().contextRefreshTimeout, 1);
+});
+
+test("runtime error after invocation counts against the daily budget", async () => {
+  const app = buildApp({ allowedSenderId: "user1" });
+  enqueueOne(app);
+  useFreshContext(app);
+  app.runtimeAdapter.sendSingleTurn = async () => { throw new Error("runtime failed after start"); };
+  const result = await app.runProactiveDrainTick();
+  assert.equal(result.results[0].action, "silent");
+  assert.equal(app.proactiveBudgetStore.load().totalCalls, 1);
   assert.equal(app.systemMessageQueueStore.load().messages.length, 0);
 });
 
-test("runPulseTick calls both runDueIntentionsCheck and runProactiveDrainTick under the same reentrancy guard", async () => {
-  const app = buildApp({ pulseIntervalMs: 30, allowedSenderId: "user1" });
-  const calls = [];
-  app.runDueIntentionsCheck = async () => { calls.push("intentions"); };
-  app.runProactiveDrainTick = async () => { calls.push("drain"); };
-
-  await app.runPulseTick();
-
-  assert.deepEqual(calls, ["intentions", "drain"]);
+test("mandatory due slot uses its own contract and satisfies only after successful delivery", async () => {
+  const app = buildApp({ allowedSenderId: "user1" });
+  const now = Date.now();
+  makeDueSlot(app, now, "morning");
+  useFreshContext(app);
+  await app.runMandatorySlotCheck(now);
+  assert.equal(app.systemMessageQueueStore.load().messages[0].forced, true);
+  app.runtimeAdapter.sendSingleTurn = async ({ resultSchema }) => {
+    assert.deepEqual(resultSchema.required, ["message", "reason"]);
+    return { structuredResult: { message: "想到你了，今天还好吗？", reason: "mandatory outreach" } };
+  };
+  app.channelAdapter.sendText = async () => {};
+  const result = await app.runProactiveDrainTick();
+  assert.equal(result.results[0].sent, true);
+  assert.equal(app.proactiveBudgetStore.getSlot("morning").satisfied, true);
+  assert.equal(app.proactiveBudgetStore.load().mandatoryCalls, 1);
 });
 
-test("runProactiveDrainTick failing does not block runDueIntentionsCheck from having run in the same tick", async () => {
+test("mandatory delivery failure persists text and retry does not call Claude again", async () => {
   const app = buildApp({ allowedSenderId: "user1" });
-  let intentionsCalled = false;
-  app.runDueIntentionsCheck = async () => { intentionsCalled = true; };
-  app.runProactiveDrainTick = async () => { throw new Error("boom"); };
+  const now = Date.now();
+  makeDueSlot(app, now, "morning");
+  useFreshContext(app);
+  await app.runMandatorySlotCheck(now);
+  let calls = 0;
+  app.runtimeAdapter.sendSingleTurn = async () => {
+    calls += 1;
+    return { structuredResult: { message: "我来陪你一下", reason: "mandatory outreach" } };
+  };
+  let deliveries = 0;
+  app.channelAdapter.sendText = async () => {
+    deliveries += 1;
+    if (deliveries === 1) throw new Error("temporary WeChat failure");
+  };
+  const first = await app.runProactiveDrainTick();
+  assert.equal(first.results[0].sent, false);
+  assert.equal(calls, 1);
+  assert.equal(app.proactiveBudgetStore.getSlot("morning").satisfied, false);
+  assert.equal(app.proactiveBudgetStore.pendingDeliveries()[0].deliveryText, "我来陪你一下");
 
+  await app.retryMandatoryDeliveries();
+  assert.equal(deliveries, 2);
+  assert.equal(calls, 1);
+  assert.equal(app.proactiveBudgetStore.getSlot("morning").satisfied, true);
+});
+
+test("an optional send inside a mandatory window satisfies that slot", async () => {
+  const app = buildApp({ allowedSenderId: "user1" });
+  const now = Date.now();
+  makeDueSlot(app, now, "morning");
+  const state = app.proactiveBudgetStore.load(now);
+  app.proactiveBudgetStore.save({
+    ...state,
+    slots: state.slots.map((slot) => slot.id === "morning"
+      ? { ...slot, targetAt: new Date(now + 60_000).toISOString() }
+      : slot),
+  });
+  enqueueOne(app);
+  useFreshContext(app);
+  app.runtimeAdapter.sendSingleTurn = async () => ({ structuredResult: { action: "send_message", message: "午安", reason: "natural" } });
+  app.channelAdapter.sendText = async () => {};
+  await app.runProactiveDrainTick();
+  assert.equal(app.proactiveBudgetStore.getSlot("morning").satisfied, true);
+});
+
+test("runPulseTick keeps intentions, mandatory checks, and drain under one guard", async () => {
+  const app = buildApp({ allowedSenderId: "user1" });
+  const calls = [];
+  app.runDueIntentionsCheck = async () => { calls.push("intentions"); };
+  app.retryMandatoryDeliveries = async () => { calls.push("delivery"); };
+  app.runMandatorySlotCheck = async () => { calls.push("mandatory"); };
+  app.runProactiveDrainTick = async () => { calls.push("drain"); };
   await app.runPulseTick();
-
-  assert.equal(intentionsCalled, true);
-  assert.equal(app.pulseTickInFlight, false, "重入保护应该在两个子任务都结束后复位");
+  assert.deepEqual(calls, ["intentions", "delivery", "mandatory", "drain"]);
 });

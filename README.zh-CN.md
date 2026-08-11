@@ -55,8 +55,8 @@ Cyberboss 的逻辑是管理权的让渡：
 2. 生活轨迹自动化报表 (The Ledger of Life)
 基于已知的消息时间戳，它会像审计员一样持续补全你全天事件的开始、结束和时长，自动将细碎的聊天记录脱水、重构为结构化时间轴，并定期向你输出“处刑报表”。
 
-3. 随机轮询唤醒 (Stochastic Pulse)
-系统会在随机频率内主动戳醒模型。它会根据当前上下文自主判断：是该温柔提醒、严厉催促、默默写日记，还是调用工具查看你的状态。这种不可预测的“查岗”感，是杀掉 ADHD 拖延症的良药。
+3. 证据门控的主动联系 (Evidence-Gated Proactive Outreach)
+本地低成本观察器会把上下文、环境和未完事项的变化积累成证据。主动 Claude 调用每天最多 6 次、两次至少间隔 90 分钟，并持久化三个日间联系时段，在普通证据不足时保证自然地出现。
 
 4. 跨时空自我唤醒 (Local Reminder Queue)
 Reminder 队列不是给用户设的闹钟，而是模型留给未来自己的伏笔。
@@ -74,7 +74,7 @@ Reminder 队列不是给用户设的闹钟，而是模型留给未来自己的�
 - 它本身就是独立项目，不依赖微信桥接才能工作
 - 如果你不想使用 Codex，也完全可以把 `timeline-for-agent` 接进你自己的 agent、bot 或自动化系统里
 
-`Cyberboss` 的时间轴能力本质上也是构建在 `timeline-for-agent` 之上，只是这里额外把它接进了微信、提醒、日记和随机轮询这整套生活监管链路里。
+`Cyberboss` 的时间轴能力本质上也是构建在 `timeline-for-agent` 之上，只是这里额外把它接进了微信、提醒、日记和证据门控的主动联系链路里。
 
 <a id="technical-stack"></a>
 ## 技术实现
@@ -86,7 +86,7 @@ Reminder 队列不是给用户设的闹钟，而是模型留给未来自己的�
 - **Task System**
   本地任务队列，当前包含 reminder、system message、timeline screenshot 三类异步任务。
 - **Capability Layer**
-  涵盖 Timeline、Diary、Check-in、File Transfer 等核心能力，其中 `checkin` 就是随机轮询唤醒入口。
+  涵盖 Timeline、Diary、证据门控的主动联系、File Transfer 等核心能力。
 - **Optional Tooling**
   支持接入 MCP 与其他本地硬件/软件接口；是否启用完全取决于你的本地环境。
 
@@ -285,11 +285,9 @@ model_catalog_json = "/绝对路径/.codex/local-models.json"
 - `npm run help`
   查看可直接执行的命令入口
 
-这里的 `checkin` 指的就是“随机轮询唤醒”能力，不是固定整点提醒。
-
 切换 runtime 只需要改 `CYBERBOSS_RUNTIME`。不需要为 Claude Code 单独学习另一套命令。
 
-`npm run start` / `npm run start:checkin` 可以用于本地最小链路调试，但不适合观察共享桥的真实行为，也不适合作为共享线程问题的默认排查入口。因此 README 只把共享模式作为默认入口。
+`npm run start` 可以用于本地最小链路调试，但不适合观察共享桥的真实行为，也不适合作为共享线程问题的默认排查入口。因此 README 只把共享模式作为默认入口。
 
 ### 用户在微信里会用到的命令
 
@@ -307,8 +305,6 @@ model_catalog_json = "/绝对路径/.codex/local-models.json"
   切换到指定线程
 - `/stop`
   停止当前线程里的运行
-- `/checkin <min>-<max>`
-  调整当前项目的随机 checkin 区间
 - `/chunk <number>`
   调整微信短回复的最小合并字符数
 - `/yes`
@@ -399,7 +395,11 @@ ${HOME}/.cyberboss
 - `reminder-queue.json`
   reminder 队列
 - `system-message-queue.json`
-  system / checkin 队列
+  主动联系候选队列
+- `event-opportunity-state.json`
+  观察快照与滚动证据
+- `proactive-budget.json`
+  每日调用预算、三个联系时段、投递状态和最近统计
 - `deferred-system-replies.json`
   等待下一个可用微信 context token 的补发消息
 - `timeline-screenshot-queue.json`
@@ -475,6 +475,7 @@ ${HOME}/.cyberboss
 ## 文档入口
 
 - [docs/commands.md](./docs/commands.md)
+- [docs/proactive-session-2.md](./docs/proactive-session-2.md)
 
 <a id="faq"></a>
 ## FAQ
@@ -483,9 +484,9 @@ ${HOME}/.cyberboss
 
 因为当前没有发布 npm package。正确方式是 `git clone` 仓库后，在项目目录里执行 `npm install`。
 
-### `checkin` 到底是什么？
+### 主动联系是怎么工作的？
 
-`checkin` 就是“随机轮询唤醒”能力。系统会在一个随机时间点唤醒模型，让它自己判断现在该不该主动出现。
+本地观察和证据累积决定什么时候值得调用模型；每天最多 6 次、两次至少间隔 90 分钟，再加上三个持久化日间时段，让主动联系有边界且分布自然。
 
 ### 为什么要在第一次运行前就设置用户名和性别？
 

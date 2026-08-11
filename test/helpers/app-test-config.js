@@ -52,8 +52,8 @@ function tempConfig(overrides = {}) {
     inboundIdleDelayMs: 60,
     inboundMaxWaitMs: 150,
     pulseIntervalMs: 40,
-    // Session 4 additions: Stochastic Pulse / Event Opportunity queue+state
-    // files under the same tmp stateDir, and deliberately unset observation
+    // Session 2 additions: proactive queue/budget/evidence state files under
+    // the same tmp stateDir, and deliberately unset observation
     // credentials — buildApp() exercises the same "not configured yet" path
     // production is actually in right now (see createTaskerSnapshotClientOrStub
     // et al. in app.js). Interval/cooldown values are fast-but-inert: nothing
@@ -63,14 +63,12 @@ function tempConfig(overrides = {}) {
     taskerSupabaseAnonKey: "",
     companionSupabaseUrl: "",
     companionSupabaseAnonKey: "",
-    checkinConfigFile: path.join(stateDir, "checkin-config.json"),
     systemMessageQueueFile: path.join(stateDir, "system-message-queue.json"),
-    checkinMinIntervalMs: 20,
-    checkinMaxIntervalMs: 20,
+    proactiveBudgetFile: path.join(stateDir, "proactive-budget.json"),
     eventOpportunityStateFile: path.join(stateDir, "event-opportunity-state.json"),
     eventOpportunityIntervalMs: 20,
-    eventOpportunityCooldownMs: 20,
     eventOpportunityLongSilenceMs: 6 * 60 * 60_000,
+    proactiveEvidenceTtlMs: 30 * 60_000,
     ...overrides,
   };
 }
