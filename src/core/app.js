@@ -16,7 +16,7 @@ const { acquireHostLock, tryAcquireHostLock, HostLockBusyError, HostLockSystemEr
 const { runAclPreflightOrThrow } = require("../adapters/runtime/claudecode");
 const { createTaskerSnapshotClient } = require("../adapters/observation/tasker-snapshot");
 const { createCompanionObservationClient } = require("../adapters/observation/companion-observation");
-const { createPetStateClient } = require("../adapters/observation/pet-state");
+const { createMorrowContextRelay } = require("../adapters/observation/morrow-context-relay");
 const { createObservationBundleBuilder } = require("./observation-bundle");
 const { createSystemMessageQueueStore } = require("./system-message-queue-store");
 const { createCheckinConfigStore } = require("./checkin-config-store");
@@ -75,7 +75,7 @@ class CyberbossApp {
     // "local-only bundle" instead of refusing to start.
     this.taskerSnapshotClient = createTaskerSnapshotClientOrStub(config);
     this.companionObservationClient = createCompanionObservationClientOrStub(config);
-    this.petStateClient = createPetStateClientOrStub(config);
+    this.morrowContextRelay = createMorrowContextRelay(config);
     this.observationBundleBuilder = createObservationBundleBuilder({
       currentStateStore: this.currentStateStore,
       memoryStore: this.memoryStore,
@@ -300,30 +300,21 @@ class CyberbossApp {
       for (const message of drained) {
         const result = await processProactiveMessage(message, {
           callRuntime: (prompt) => this.runtimeAdapter.sendSingleTurn({ text: prompt, resultSchema: PROACTIVE_RESULT_JSON_SCHEMA }),
-          // Task #12 round 2: a real on-demand request, not a re-read of
-          // whatever was last passively collected (that was this session's
-          // first pass — corrected once flagged). Push a fresh requestId via
-          // keke_state's Realtime channel (pet-state.js), then poll
-          // companion_events for the device's answer (companion-observation.js)
-          // — bounded by config.contextSnapshotTimeoutMs, so an unreachable
-          // device degrades to an error the round-2 prompt renders as
-          // "(unavailable)" rather than hanging the drain tick. Never a
-          // screenshot/image — see AccessibilityPrivacyFilter.kt on the
-          // device side for what does and doesn't get captured.
+          // Task #12 round 2: ask Morrow's loopback relay for a fresh
+          // Accessibility read. The relay emits context_request on the same
+          // authenticated Clawd SSE and waits for Clawd's filtered response;
+          // it never writes a Supabase state row or polls companion_events.
           fetchRefreshedContext: async () => {
             const requestId = crypto.randomUUID();
-            await this.petStateClient.requestContextSnapshot({ requestId });
-            return this.companionObservationClient.getContextSnapshot({
+            return this.morrowContextRelay.requestContext({
               requestId,
               timeoutMs: this.config.contextSnapshotTimeoutMs,
-              pollIntervalMs: this.config.contextSnapshotPollIntervalMs,
             });
           },
           sendMessage: (text) => this.channelAdapter.sendText({ userId: allowedSenderId, text }).then(() => true).catch((error) => {
             console.error(`[cyberboss] proactive send failed: ${formatErrorMessage(error)}`);
             return false;
           }),
-          pushExpression: (payload) => this.petStateClient.pushExpression(payload),
           markAgentMessageSent: (nowIso) => {
             const state = this.currentStateStore.load();
             this.currentStateStore.save(this.currentStateStore.applyPatch(state, {}, { lastAgentMessageAt: nowIso }));
@@ -611,17 +602,6 @@ function createCompanionObservationClientOrStub(config) {
   return {
     async getRecentSegments() {
       throw new Error("companion observation not configured (CYBERBOSS_COMPANION_SUPABASE_URL/ANON_KEY unset)");
-    },
-  };
-}
-
-function createPetStateClientOrStub(config) {
-  if (config.companionSupabaseUrl && config.companionSupabaseAnonKey) {
-    return createPetStateClient(config);
-  }
-  return {
-    async pushExpression() {
-      throw new Error("pet-state not configured (CYBERBOSS_COMPANION_SUPABASE_URL/ANON_KEY unset)");
     },
   };
 }

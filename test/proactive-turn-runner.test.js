@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { processProactiveMessage, truncateForBubble } = require("../src/core/proactive-turn-runner");
+const { processProactiveMessage } = require("../src/core/proactive-turn-runner");
 
 function baseMessage(overrides = {}) {
   return {
@@ -18,29 +18,18 @@ function stubs(overrides = {}) {
     callRuntime: async () => ({ structuredResult: { action: "silent", message: null, reason: "nothing going on" } }),
     fetchRefreshedContext: async () => [],
     sendMessage: async () => true,
-    pushExpression: async () => {},
     markAgentMessageSent: () => {},
     onLog: () => {},
     ...overrides,
   };
 }
 
-test("truncateForBubble leaves short text untouched, truncates long text with an ellipsis", () => {
-  assert.equal(truncateForBubble("短消息"), "短消息");
-  const long = "a".repeat(60);
-  const truncated = truncateForBubble(long);
-  assert.equal(truncated.length, 41); // 40 chars + ellipsis
-  assert.ok(truncated.endsWith("…"));
-});
-
-test("send_message: sends via sendMessage, marks lastAgentMessageAt, pushes keke_state expression", async () => {
+test("send_message: sends via sendMessage and marks lastAgentMessageAt without a Clawd side effect", async () => {
   const sentTexts = [];
-  const pushed = [];
   const marked = [];
   const result = await processProactiveMessage(baseMessage(), stubs({
     callRuntime: async () => ({ structuredResult: { action: "send_message", message: "在忙吗，想你了", reason: "quiet a while" } }),
     sendMessage: async (text) => { sentTexts.push(text); return true; },
-    pushExpression: async (payload) => { pushed.push(payload); },
     markAgentMessageSent: (nowIso) => marked.push(nowIso),
   }));
 
@@ -48,24 +37,18 @@ test("send_message: sends via sendMessage, marks lastAgentMessageAt, pushes keke
   assert.equal(result.sent, true);
   assert.deepEqual(sentTexts, ["在忙吗，想你了"]);
   assert.equal(marked.length, 1);
-  assert.equal(pushed.length, 1);
-  assert.equal(pushed[0].expression, "alert");
-  assert.equal(pushed[0].bubbleText, "在忙吗，想你了");
 });
 
-test("send_message: sendMessage returning false skips lastAgentMessageAt and keke_state push", async () => {
-  const pushed = [];
+test("send_message: sendMessage returning false skips lastAgentMessageAt", async () => {
   const marked = [];
   const result = await processProactiveMessage(baseMessage(), stubs({
     callRuntime: async () => ({ structuredResult: { action: "send_message", message: "hi", reason: "r" } }),
     sendMessage: async () => false,
-    pushExpression: async (payload) => { pushed.push(payload); },
     markAgentMessageSent: (nowIso) => marked.push(nowIso),
   }));
 
   assert.equal(result.sent, false);
   assert.equal(marked.length, 0);
-  assert.equal(pushed.length, 0);
 });
 
 test("send_message: sendMessage throwing is treated as not-sent, not a crash", async () => {
@@ -76,19 +59,16 @@ test("send_message: sendMessage throwing is treated as not-sent, not a crash", a
   assert.equal(result.sent, false);
 });
 
-test("silent: no sendMessage/pushExpression/markAgentMessageSent calls", async () => {
+test("silent: no sendMessage/markAgentMessageSent calls", async () => {
   let sendCalled = false;
-  let pushCalled = false;
   let markCalled = false;
   const result = await processProactiveMessage(baseMessage(), stubs({
     callRuntime: async () => ({ structuredResult: { action: "silent", message: null, reason: "quiet" } }),
     sendMessage: async () => { sendCalled = true; return true; },
-    pushExpression: async () => { pushCalled = true; },
     markAgentMessageSent: () => { markCalled = true; },
   }));
   assert.equal(result.action, "silent");
   assert.equal(sendCalled, false);
-  assert.equal(pushCalled, false);
   assert.equal(markCalled, false);
 });
 
@@ -136,11 +116,11 @@ test("need_context: fetchRefreshedContext throwing still proceeds to round 2 wit
         ? { structuredResult: { action: "need_context", message: null, reason: "r" } }
         : { structuredResult: { action: "silent", message: null, reason: "still nothing after refresh" } };
     },
-    fetchRefreshedContext: async () => { throw new Error("companion supabase down"); },
+    fetchRefreshedContext: async () => { throw new Error("Morrow context relay unavailable"); },
   }));
 
   assert.equal(prompts.length, 2);
-  assert.match(prompts[1], /Refreshed Accessibility context: \(unavailable — companion supabase down\)/);
+  assert.match(prompts[1], /Refreshed Accessibility context: \(unavailable — Morrow context relay unavailable\)/);
   assert.equal(result.action, "silent");
 });
 

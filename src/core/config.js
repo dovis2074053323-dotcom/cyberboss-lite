@@ -75,12 +75,9 @@ function readConfig() {
     // Overridable only so tests don't have to wait 60 real seconds per tick.
     pulseIntervalMs: readIntEnv("CYBERBOSS_PULSE_INTERVAL_MS") || 60_000,
 
-    // Observation sources (this session's Cyberboss Proactive + keke-overflow
-    // Companion rework): Tasker's Supabase project (health_snapshot/
-    // activity_snapshot, the documented Snapshot layer — not agent_dashboard's
-    // text summary) and keke-overflow's own project (structured
-    // companion_segments read, keke_state expression write — Cyberboss is now
-    // the only writer of keke_state since jiwen/sentinel were retired).
+    // Observation sources: Tasker's Supabase project and keke-overflow's
+    // structured companion_segments read. Cyberboss no longer writes Clawd
+    // expression/bubble state or uses Supabase as a request/response bridge.
     // No defaults baked in on purpose (same posture as sharedCredentialsFile
     // above) — these are read-scoped anon keys, not secrets on the level of
     // the WeChat/Claude credentials, but still don't belong hardcoded in a repo.
@@ -89,14 +86,11 @@ function readConfig() {
     companionSupabaseUrl: readTextEnv("CYBERBOSS_COMPANION_SUPABASE_URL"),
     companionSupabaseAnonKey: readTextEnv("CYBERBOSS_COMPANION_SUPABASE_ANON_KEY"),
 
-    // Task #12's real on-demand snapshot round trip (request via keke_state's
-    // Realtime channel, poll companion_events for the device's answer) — see
-    // companion-observation.js's getContextSnapshot / pet-state.js's
-    // requestContextSnapshot. Bounded so a screen-off/backgrounded/unreachable
-    // device degrades to a timeout error (caught upstream, round 2 still runs
-    // with an "(unavailable)" marker) instead of hanging the drain tick.
+    // Task #12's on-demand snapshot round trip now uses the same local Morrow
+    // relay as Clawd's authenticated SSE. Bounded so a screen-off,
+    // backgrounded, or unreachable device degrades to an explicit error.
+    morrowBaseUrl: readTextEnv("CYBERBOSS_MORROW_URL") || "http://127.0.0.1:8787",
     contextSnapshotTimeoutMs: readIntEnv("CYBERBOSS_CONTEXT_SNAPSHOT_TIMEOUT_MS") || 15_000,
-    contextSnapshotPollIntervalMs: readIntEnv("CYBERBOSS_CONTEXT_SNAPSHOT_POLL_INTERVAL_MS") || 1_500,
 
     // Stochastic Pulse (upstream WenXiaoWendy/cyberboss's
     // system-checkin-poller.js, ported this session): random-interval wake-up

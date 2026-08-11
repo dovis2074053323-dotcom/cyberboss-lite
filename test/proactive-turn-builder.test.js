@@ -25,8 +25,8 @@ test("round 2 (refreshedContext given): drops need_context from the menu entirel
 });
 
 test("round 2 with an error marker renders (unavailable) — the request itself never got a response", () => {
-  const prompt = buildProactiveTurnPrompt({}, { refreshedContext: { error: "timed out waiting for context_snapshot response" } });
-  assert.match(prompt, /Refreshed Accessibility context: \(unavailable — timed out waiting for context_snapshot response\)/);
+  const prompt = buildProactiveTurnPrompt({}, { refreshedContext: { error: "Morrow context relay timed out" } });
+  assert.match(prompt, /Refreshed Accessibility context: \(unavailable — Morrow context relay timed out\)/);
   assert.doesNotMatch(prompt, /"action":"need_context"/);
 });
 

@@ -65,19 +65,17 @@ test("lock busy: skips, message stays queued for the next tick", async () => {
   }
 });
 
-test("send_message end to end: WeChat send called, keke_state pushed, lastAgentMessageAt updated, queue drained", async () => {
+test("send_message end to end: WeChat send called, lastAgentMessageAt updated, queue drained without Clawd visual output", async () => {
   const app = buildApp({ allowedSenderId: "user1" });
   enqueueOne(app);
 
   const sent = [];
-  const pushed = [];
   app.runtimeAdapter.sendSingleTurn = async ({ text, resultSchema }) => {
     assert.ok(text.includes("SYSTEM ACTION MODE"), "应该用 proactive-turn-builder 渲染的 prompt");
     assert.ok(resultSchema, "应该传入窄契约 schema，不是默认的 RESULT_JSON_SCHEMA");
     return { structuredResult: { action: "send_message", message: "在干嘛呀", reason: "quiet a while" } };
   };
   app.channelAdapter.sendText = async ({ userId, text }) => { sent.push({ userId, text }); };
-  app.petStateClient.pushExpression = async (payload) => { pushed.push(payload); };
 
   const result = await app.runProactiveDrainTick();
 
@@ -86,15 +84,13 @@ test("send_message end to end: WeChat send called, keke_state pushed, lastAgentM
   assert.equal(result.results[0].action, "send_message");
   assert.equal(result.results[0].sent, true);
   assert.deepEqual(sent, [{ userId: "user1", text: "在干嘛呀" }]);
-  assert.equal(pushed.length, 1);
-  assert.equal(pushed[0].expression, "alert");
   assert.equal(app.systemMessageQueueStore.load().messages.length, 0);
 
   const state = app.currentStateStore.load();
   assert.ok(state.lastAgentMessageAt, "lastAgentMessageAt 应该被更新");
 });
 
-test("need_context end to end: app.js pushes a real requestId via petStateClient, then polls companionObservationClient for the device's answer", async () => {
+test("need_context end to end: app.js asks the loopback Morrow relay with one requestId", async () => {
   const app = buildApp({ allowedSenderId: "user1" });
   enqueueOne(app);
 
@@ -109,38 +105,31 @@ test("need_context end to end: app.js pushes a real requestId via petStateClient
     return { structuredResult: { action: "silent", message: null, reason: "still nothing after refresh" } };
   };
   let requestedId = null;
-  app.petStateClient.requestContextSnapshot = async ({ requestId }) => { requestedId = requestId; };
-  let fetchCalled = false;
-  app.companionObservationClient.getContextSnapshot = async ({ requestId }) => {
-    fetchCalled = true;
-    assert.equal(requestId, requestedId, "轮询用的 requestId 应该和刚推送的是同一个");
-    return { created_at: "2026-08-09T12:00:00Z", detail: { requestId, package: "com.android.chrome" } };
+  app.morrowContextRelay.requestContext = async ({ requestId }) => {
+    requestedId = requestId;
+    return { created_at: "2026-08-11T12:00:00Z", detail: { requestId, package: "com.android.chrome" } };
   };
 
   const result = await app.runProactiveDrainTick();
 
-  assert.ok(requestedId, "应该真的推送了一个 requestId，不是老的被动重读");
-  assert.equal(fetchCalled, true);
+  assert.ok(requestedId, "应该真的经 Morrow relay 发出一个 requestId");
   assert.equal(calls, 2);
   assert.match(prompts[1], /Refreshed Accessibility context/);
   assert.equal(result.results[0].action, "silent");
 });
 
-test("silent: no WeChat send, no keke_state push, queue still drained", async () => {
+test("silent: no WeChat send or Clawd visual output, queue still drained", async () => {
   const app = buildApp({ allowedSenderId: "user1" });
   enqueueOne(app);
 
   let sendCalled = false;
-  let pushCalled = false;
   app.runtimeAdapter.sendSingleTurn = async () => ({ structuredResult: { action: "silent", message: null, reason: "nothing new" } });
   app.channelAdapter.sendText = async () => { sendCalled = true; };
-  app.petStateClient.pushExpression = async () => { pushCalled = true; };
 
   const result = await app.runProactiveDrainTick();
 
   assert.equal(result.results[0].action, "silent");
   assert.equal(sendCalled, false);
-  assert.equal(pushCalled, false);
   assert.equal(app.systemMessageQueueStore.load().messages.length, 0);
 });
 

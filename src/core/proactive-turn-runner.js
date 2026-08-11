@@ -1,17 +1,9 @@
 const { buildProactiveTurnPrompt } = require("./proactive-turn-builder");
 const { evaluateProactiveResult } = require("./proactive-result-schema");
 
-// Bubble text is a small on-screen popup (pet.html's showBubble, ~40 chars
-// visible before it just looks broken), not the actual message — the real
-// text always goes out over WeChat via sendMessage. This is only the pet's
-// supplementary "I just said something" reaction.
-const BUBBLE_MAX_CHARS = 40;
-
-function truncateForBubble(text) {
-  const value = String(text || "").trim();
-  return value.length > BUBBLE_MAX_CHARS ? `${value.slice(0, BUBBLE_MAX_CHARS)}…` : value;
-}
-
+// The real text always goes out over WeChat via sendMessage. Clawd receives
+// only Morrow's reply_ready semantic event, so this runner has no visual
+// output side effect of its own.
 function formatError(error) {
   return error instanceof Error ? error.message : String(error || "unknown error");
 }
@@ -35,7 +27,6 @@ async function processProactiveMessage(message, {
   callRuntime,           // (prompt) => Promise<{ structuredResult }>
   fetchRefreshedContext, // () => Promise<Array|{error}> — task #12 round 2 fetch
   sendMessage,           // (text) => Promise<boolean>
-  pushExpression,        // ({ expression, bubbleText }) => Promise<void>
   markAgentMessageSent,  // (nowIso) => void — synchronous, local bookkeeping only
   onLog = () => {},
 }) {
@@ -56,7 +47,7 @@ async function processProactiveMessage(message, {
     }
   }
 
-  return applyDecision(message, evaluation, { sendMessage, pushExpression, markAgentMessageSent, onLog });
+  return applyDecision(message, evaluation, { sendMessage, markAgentMessageSent, onLog });
 }
 
 // One runtime call + validation, normalized so both a thrown error and a
@@ -86,7 +77,7 @@ async function runRound(message, prompt, callRuntime, onLog) {
 // By the time this runs, `evaluation.action` is guaranteed to be one of
 // send_message/silent/defer — need_context is fully resolved (round 2 or the
 // two-round cap fallback) before processProactiveMessage calls this.
-async function applyDecision(message, evaluation, { sendMessage, pushExpression, markAgentMessageSent, onLog }) {
+async function applyDecision(message, evaluation, { sendMessage, markAgentMessageSent, onLog }) {
   if (evaluation.action === "send_message") {
     const sent = await Promise.resolve()
       .then(() => sendMessage(evaluation.message))
@@ -96,8 +87,6 @@ async function applyDecision(message, evaluation, { sendMessage, pushExpression,
       });
     if (sent) {
       markAgentMessageSent(new Date().toISOString());
-      await pushExpression({ expression: "alert", bubbleText: truncateForBubble(evaluation.message) })
-        .catch((error) => onLog(`proactive turn ${message.id} keke_state push failed: ${formatError(error)}`));
     }
     return { id: message.id, source: message.source, action: "send_message", sent, reason: evaluation.reason };
   }
@@ -108,4 +97,4 @@ async function applyDecision(message, evaluation, { sendMessage, pushExpression,
   return { id: message.id, source: message.source, action: evaluation.action, sent: false, reason: evaluation.reason };
 }
 
-module.exports = { processProactiveMessage, truncateForBubble, BUBBLE_MAX_CHARS };
+module.exports = { processProactiveMessage };

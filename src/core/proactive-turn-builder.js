@@ -7,19 +7,15 @@
 //
 // Two-round relay (task #12): round 1 gets `refreshedContext` undefined and
 // may answer `need_context`; round 2 (proactive-turn-runner.js, after a real
-// on-demand device round trip — see companion-observation.js's
-// getContextSnapshot) passes `refreshedContext` and the prompt drops
+// on-demand device round trip through Morrow's context relay) passes
+// `refreshedContext` and the prompt drops
 // `need_context` from the menu entirely — a hard cap at two rounds, not a
 // suggestion left to the model's judgment, so a model that keeps asking
 // can't turn one wake-up into an unbounded chain of Claude calls.
-// `refreshedContext` is a single `companion_events` row (`{detail,
-// created_at}`) the device wrote in direct response to this turn's request —
-// `detail` may carry real `package`/`activity`/`title`/sanitized `url`, or
-// `filtered: true` + `filterReason` if the device's own privacy rules
-// suppressed it (see keke-overflow's AccessibilityPrivacyFilter.kt) — never
-// an image (task #12 chose "refresh the existing text signal on demand" over
-// building real screenshot transport; see proactive-result-schema.js's
-// `need_context` comment for the full rationale).
+// `refreshedContext` is the Morrow relay's normalized response (`{detail,
+// created_at}`). `detail` may carry real `package`/`activity`/`title`/sanitized
+// `url`, or `filtered: true` + `filterReason` if the device's own privacy
+// rules suppressed it — never an image.
 
 function buildProactiveTurnPrompt(bundle, { refreshedContext } = {}) {
   const isRound2 = refreshedContext !== undefined;
@@ -101,9 +97,9 @@ function formatSegmentsSection(segments) {
   return `Recent companion segments:\n${lines.join("\n")}`;
 }
 
-// A single companion_events row (event=context_snapshot) the device wrote in
-// direct, real-time response to this turn's on-demand request — not a
-// re-read of whatever was last passively collected. `detail.filtered` means
+// A single Morrow relay response the device wrote in direct, real-time
+// response to this turn's on-demand request — not a re-read of whatever was
+// last passively collected. `detail.filtered` means
 // the device saw the request and looked, but its own privacy rules withheld
 // the content (sensitive app, or a package like WeChat that never yields
 // message-body text) — that's a real, informative answer, not a failure, so
