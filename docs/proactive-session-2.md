@@ -27,7 +27,13 @@ context; it never causes a second model call.
 - Six proactive Claude calls per local day.
 - At least 90 minutes between proactive calls.
 - Optional calls reserve the remaining three unsatisfied slots.
-- Morning, afternoon, and evening slots persist their randomized `targetAt`.
+- Morning, afternoon, and evening slots persist their randomized `targetAt`; each
+  target is sampled from `startAt` through `endAt - 90 minutes - 15 minutes`.
+  The 15-minute margin keeps a mandatory call eligible inside its window even
+  when an optional silent decision happens immediately before the target.
+- A slot definition narrower than the 90-minute gap plus the 15-minute safety
+  margin is a configuration error and fails fast; it never creates an
+  out-of-window target.
 - An optional successful message satisfies the slot it lands in.
 - A forced slot gets one model call with a send-only result contract.
 - A failed WeChat delivery stores the generated text for delivery-only retry;

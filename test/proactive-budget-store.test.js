@@ -4,7 +4,12 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-const { createProactiveBudgetStore } = require("../src/core/proactive-budget-store");
+const {
+  createProactiveBudgetStore,
+  buildSlots,
+  MIN_CALL_GAP_MS,
+  TARGET_SAFETY_MARGIN_MS,
+} = require("../src/core/proactive-budget-store");
 
 function tempConfig() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-proactive-budget-test-"));
@@ -13,6 +18,35 @@ function tempConfig() {
 
 const DAY1 = new Date("2026-08-11T02:00:00Z").getTime();
 const GAP = 90 * 60 * 1000;
+
+test("targets stay inside every slot's safe range and random endpoints are bounded", () => {
+  const atStart = buildSlots("2026-08-11", () => 0);
+  const atLatest = buildSlots("2026-08-11", () => 1);
+
+  assert.equal(atStart.length, 3);
+  for (const [index, slot] of atStart.entries()) {
+    const startMs = new Date(slot.startAt).getTime();
+    const endMs = new Date(slot.endAt).getTime();
+    const latestTargetMs = endMs - MIN_CALL_GAP_MS - TARGET_SAFETY_MARGIN_MS;
+    assert.equal(new Date(slot.targetAt).getTime(), startMs);
+    assert.ok(new Date(atLatest[index].targetAt).getTime() <= latestTargetMs);
+    assert.ok(new Date(atLatest[index].targetAt).getTime() >= startMs);
+  }
+});
+
+test("a slot that cannot contain the gap and safety margin fails fast", () => {
+  assert.throws(
+    () => buildSlots("2026-08-11", () => 0, [{
+      id: "too-short",
+      label: "too-short",
+      startHour: 10,
+      startMinute: 0,
+      endHour: 11,
+      endMinute: 44,
+    }]),
+    /Invalid proactive slot too-short: window is too short/,
+  );
+});
 
 test("a new day creates three persisted random target times", () => {
   const config = tempConfig();
@@ -24,6 +58,38 @@ test("a new day creates three persisted random target times", () => {
   const restarted = createProactiveBudgetStore(config, { random: () => 0.9 });
   const sameDay = restarted.load(DAY1 + 60_000);
   assert.deepEqual(sameDay.slots.map((slot) => slot.targetAt), initial.slots.map((slot) => slot.targetAt));
+});
+
+test("target generation waits for the daily reset before drawing new targets", () => {
+  const config = tempConfig();
+  let randomValue = 0;
+  const store = createProactiveBudgetStore(config, {
+    random: () => randomValue,
+  });
+
+  const firstDay = store.load(DAY1);
+  randomValue = 1;
+  const sameDay = store.load(DAY1 + 60_000);
+  assert.deepEqual(sameDay.slots.map((slot) => slot.targetAt), firstDay.slots.map((slot) => slot.targetAt));
+  const nextDay = store.load(DAY1 + 24 * 60 * 60 * 1000);
+  for (const slot of nextDay.slots) {
+    const endMs = new Date(slot.endAt).getTime();
+    const latestTargetMs = endMs - MIN_CALL_GAP_MS - TARGET_SAFETY_MARGIN_MS;
+    assert.equal(new Date(slot.targetAt).getTime(), latestTargetMs);
+  }
+});
+
+test("a silent optional call immediately before target leaves the full gap inside the slot", () => {
+  const store = createProactiveBudgetStore(tempConfig(), { random: () => 1 });
+  const slot = store.load(DAY1).slots[0];
+  const targetMs = new Date(slot.targetAt).getTime();
+  const optionalAt = targetMs - 1;
+  const forcedAt = optionalAt + MIN_CALL_GAP_MS;
+
+  assert.equal(store.reserveCall({ nowMs: optionalAt }).allowed, true);
+  assert.ok(forcedAt >= targetMs);
+  assert.ok(forcedAt < new Date(slot.endAt).getTime());
+  assert.equal(store.reserveCall({ forced: true, nowMs: forcedAt }).allowed, true);
 });
 
 test("forced reservations have a hard six-call daily cap", () => {

@@ -2,6 +2,7 @@ const { readJsonStore, writeJsonStoreAtomic } = require("./json-store");
 
 const MAX_PROACTIVE_CALLS_PER_DAY = 6;
 const MIN_CALL_GAP_MS = 90 * 60 * 1000;
+const TARGET_SAFETY_MARGIN_MS = 15 * 60 * 1000;
 const RECENT_DAYS_TO_KEEP = 30;
 
 const SLOT_DEFINITIONS = Object.freeze([
@@ -40,16 +41,26 @@ function localDateKey(nowMs) {
   return `${year}-${month}-${day}`;
 }
 
-function buildSlots(dateKey, random = Math.random) {
+function buildSlots(dateKey, random = Math.random, definitions = SLOT_DEFINITIONS) {
   const [year, month, day] = dateKey.split("-").map(Number);
   const base = new Date(year, month - 1, day);
-  return SLOT_DEFINITIONS.map((definition) => {
+  return definitions.map((definition) => {
     const start = new Date(base);
     start.setHours(definition.startHour, definition.startMinute, 0, 0);
     const end = new Date(base);
     end.setHours(definition.endHour, definition.endMinute, 0, 0);
-    const spanMinutes = Math.max(1, Math.floor((end.getTime() - start.getTime()) / 60_000));
-    const offsetMinutes = Math.min(spanMinutes - 1, Math.floor(Math.max(0, Math.min(0.999999, random())) * spanMinutes));
+    const latestTargetMs = end.getTime() - MIN_CALL_GAP_MS - TARGET_SAFETY_MARGIN_MS;
+    if (latestTargetMs < start.getTime()) {
+      throw new Error(
+        `Invalid proactive slot ${definition.id}: window is too short for a ${MIN_CALL_GAP_MS / 60_000}-minute call gap and ${TARGET_SAFETY_MARGIN_MS / 60_000}-minute target safety margin`,
+      );
+    }
+    const targetRangeMinutes = Math.floor((latestTargetMs - start.getTime()) / 60_000);
+    const normalizedRandom = Math.max(0, Math.min(1, Number(random())));
+    const offsetMinutes = Math.min(
+      targetRangeMinutes,
+      Math.floor(normalizedRandom * (targetRangeMinutes + 1)),
+    );
     const targetAt = new Date(start.getTime() + offsetMinutes * 60_000);
     return {
       id: definition.id,
@@ -346,6 +357,7 @@ function createProactiveBudgetStore(config, options = {}) {
     localDateKey,
     maxCallsPerDay: MAX_PROACTIVE_CALLS_PER_DAY,
     minCallGapMs: MIN_CALL_GAP_MS,
+    targetSafetyMarginMs: TARGET_SAFETY_MARGIN_MS,
     slotDefinitions: SLOT_DEFINITIONS,
   };
 }
@@ -354,6 +366,7 @@ module.exports = {
   createProactiveBudgetStore,
   MAX_PROACTIVE_CALLS_PER_DAY,
   MIN_CALL_GAP_MS,
+  TARGET_SAFETY_MARGIN_MS,
   SLOT_DEFINITIONS,
   METRIC_KEYS,
   buildSlots,
