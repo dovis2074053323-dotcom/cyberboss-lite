@@ -5,6 +5,8 @@
  * authenticated Clawd SSE then carries the request to the Android companion,
  * which posts the filtered/unfiltered result back to Morrow.
  */
+const { sanitizeClawdContext } = require("../../core/privacy-gate");
+
 function createMorrowContextRelay(config) {
   const baseUrl = String(config.morrowBaseUrl || "http://127.0.0.1:8787").replace(/\/$/, "");
 
@@ -34,7 +36,10 @@ function createMorrowContextRelay(config) {
       }
       return {
         created_at: new Date().toISOString(),
-        detail: body,
+        detail: {
+          requestId: typeof body.requestId === "string" ? body.requestId : requestId,
+          ...sanitizeClawdContext(body),
+        },
       };
     } catch (error) {
       if (error?.name === "AbortError") {

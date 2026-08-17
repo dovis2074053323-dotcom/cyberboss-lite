@@ -1,4 +1,5 @@
 const { createSupabaseRestClient } = require("./supabase-rest");
+const { sanitizeTaskerSnapshot } = require("../../core/privacy-gate");
 
 // Reads Tasker's already-structured Snapshot layer directly — health_snapshot /
 // activity_snapshot — instead of `agent_dashboard`'s pre-formatted text
@@ -23,13 +24,17 @@ function createTaskerSnapshotClient(config) {
 
   async function getSnapshot() {
     const [healthRows, activityRows] = await Promise.all([
-      client.select("health_snapshot", "select=*"),
-      client.select("activity_snapshot", "select=*"),
+      // Query only the non-health, non-location projection. The gate is
+      // therefore applied before sensitive Tasker columns enter Cyberboss's
+      // process, and the sanitizer below remains the defense for old schema
+      // or stub data.
+      client.select("health_snapshot", "select=battery_level,battery_charging,weather_desc,updated_at"),
+      client.select("activity_snapshot", "select=current_app,previous_app,session_start,app_usage_today,app_open_count,updated_at"),
     ]);
-    return {
+    return sanitizeTaskerSnapshot({
       health: healthRows?.[0] || null,
       activity: activityRows?.[0] || null,
-    };
+    });
   }
 
   return { getSnapshot };

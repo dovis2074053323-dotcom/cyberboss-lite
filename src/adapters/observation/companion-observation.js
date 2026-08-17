@@ -1,4 +1,5 @@
 const { createSupabaseRestClient } = require("./supabase-rest");
+const { sanitizeCompanionSegments } = require("../../core/privacy-gate");
 
 // Reads keke-overflow's structured companion data — companion_segments is the
 // one to prefer (server-aggregated, low-frequency, already deduped/merged by
@@ -20,13 +21,13 @@ function createCompanionObservationClient(config) {
   });
 
   async function getRecentSegments({ sinceIso, limit = 20 } = {}) {
-    const parts = ["select=start_ts,end_ts,summary,contexts,screen_active,interaction", "order=start_ts.desc"];
+    const parts = ["select=start_ts,end_ts,contexts,screen_active,interaction", "order=start_ts.desc"];
     if (sinceIso) {
       parts.push(`start_ts=gte.${encodeURIComponent(sinceIso)}`);
     }
     parts.push(`limit=${limit}`);
     const rows = await client.select("companion_segments", parts.join("&"));
-    return Array.isArray(rows) ? rows : [];
+    return sanitizeCompanionSegments(Array.isArray(rows) ? rows : []);
   }
 
   return { getRecentSegments };

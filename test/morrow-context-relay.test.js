@@ -43,6 +43,26 @@ test("Morrow relay preserves an explicit filtered response and turns HTTP failur
     global.fetch = original;
   }
 
+  global.fetch = async () => ({
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify({
+      requestId: "req-private",
+      filtered: true,
+      filterReason: "user_blocked_app",
+      package: "com.example.private",
+      activity: "SecretActivity",
+      title: "secret",
+      url: "https://example.test/secret",
+    }),
+  });
+  try {
+    const result = await createMorrowContextRelay({ morrowBaseUrl: "http://127.0.0.1:8787" }).requestContext({ requestId: "req-private" });
+    assert.deepEqual(result.detail, { requestId: "req-private", filtered: true, filterReason: "user_blocked_app" });
+  } finally {
+    global.fetch = original;
+  }
+
   global.fetch = async () => ({ ok: false, status: 404, text: async () => JSON.stringify({ error: "not found" }) });
   try {
     await assert.rejects(

@@ -74,8 +74,14 @@ test("supabase-rest throws with status+body on a non-ok response", async () => {
 
 test("tasker-snapshot.getSnapshot fetches both tables and returns first row or null", async () => {
   const stub = stubFetch((url) => {
-    if (url.includes("health_snapshot")) return jsonResponse([{ latest_hr: 71 }]);
-    if (url.includes("activity_snapshot")) return jsonResponse([]);
+    if (url.includes("health_snapshot")) {
+      assert.match(url, /select=battery_level,battery_charging,weather_desc,updated_at/);
+      return jsonResponse([{ latest_hr: 71, battery_level: 83, weather_desc: "rain 27C", city: "Shanghai" }]);
+    }
+    if (url.includes("activity_snapshot")) {
+      assert.match(url, /select=current_app,previous_app,session_start,app_usage_today,app_open_count,updated_at/);
+      return jsonResponse([]);
+    }
     throw new Error(`unexpected url ${url}`);
   });
   try {
@@ -84,7 +90,7 @@ test("tasker-snapshot.getSnapshot fetches both tables and returns first row or n
       taskerSupabaseAnonKey: "k",
     });
     const snapshot = await client.getSnapshot();
-    assert.deepEqual(snapshot, { health: { latest_hr: 71 }, activity: null });
+    assert.deepEqual(snapshot, { health: { battery_level: 83, weather_desc: "rain 27C" } });
   } finally {
     stub.restore();
   }
@@ -95,7 +101,7 @@ test("companion-observation.getRecentSegments returns rows with native jsonb (no
     assert.match(url, /companion_segments/);
     assert.match(url, /start_ts=gte\.2026-08-09T00%3A00%3A00Z/);
     return jsonResponse([
-      { start_ts: "t1", end_ts: "t2", summary: "1 context(s), 0 interaction(s)", contexts: [{ package: "com.android.chrome" }], screen_active: true, interaction: {} },
+      { start_ts: "t1", end_ts: "t2", summary: "ignored", contexts: [{ package: "com.android.chrome" }], screen_active: true, interaction: {} },
     ]);
   });
   try {
@@ -106,6 +112,7 @@ test("companion-observation.getRecentSegments returns rows with native jsonb (no
     const rows = await client.getRecentSegments({ sinceIso: "2026-08-09T00:00:00Z" });
     assert.equal(rows.length, 1);
     assert.deepEqual(rows[0].contexts, [{ package: "com.android.chrome" }]);
+    assert.equal("summary" in rows[0], false);
   } finally {
     stub.restore();
   }
