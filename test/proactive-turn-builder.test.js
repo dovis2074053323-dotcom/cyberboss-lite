@@ -45,9 +45,33 @@ test("renders lists and compact companion segments", () => {
   const prompt = buildProactiveTurnPrompt({
     openLoops: ["答应帮她订生日蛋糕"],
     coreMemories: ["喜欢薄荷绿"],
-    companionSegments: [{ start_ts: "a", end_ts: "b", screen_active: true, contexts: [{ package: "com.tencent.mm" }], interaction: { tap: 2 } }],
+    companionSegments: [{
+      start_ts: "2026-08-09T06:00:00Z",
+      end_ts: "2026-08-09T06:10:00Z",
+      summary: "chatting, 10m, active",
+      screen_active: true,
+      contexts: [{ package: "com.tencent.mm" }],
+      interaction: { tap: 2 },
+    }],
   }, { freshContext: null });
   assert.match(prompt, /Open loops:\n- 答应帮她订生日蛋糕/);
   assert.match(prompt, /Core memory:\n- 喜欢薄荷绿/);
-  assert.match(prompt, /a~b screen_active=true contexts=\[{"package":"com\.tencent\.mm"}\]/);
+  assert.match(prompt, /Recent companion timeline:/);
+  assert.match(prompt, /14:00–14:10 chatting, 10m, active \(tap=2\)/);
+  assert.doesNotMatch(prompt, /contexts=|package=|activity=|title=|url=|com\.tencent\.mm/);
+});
+
+test("proactive timeline sanitizes legacy verbose summaries before prompting", () => {
+  const prompt = buildProactiveTurnPrompt({
+    companionSegments: [{
+      start_ts: "2026-08-09T06:00:00Z",
+      end_ts: "2026-08-09T06:10:00Z",
+      summary: "title=Secret https://example.test/private query=passport",
+      contexts: [{ package: "com.example.notes", title: "Secret" }],
+      interaction: { tap: 1, detail: "raw" },
+    }],
+  }, { freshContext: null });
+  assert.match(prompt, /Recent companion timeline:/);
+  assert.match(prompt, /activity summary unavailable \(tap=1\)/);
+  assert.doesNotMatch(prompt, /Secret|https|passport|title=|query=|contexts=|package=|url=/);
 });

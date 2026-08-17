@@ -11,7 +11,13 @@ function bundle(overrides = {}) {
   return {
     currentState: { lastUserMessageAt: "2026-08-09T11:00:00Z" },
     openLoops: ["loop A"],
-    companionSegments: [{ start_ts: "2026-08-09T11:50:00Z" }],
+    companionSegments: [{
+      start_ts: "2026-08-09T11:50:00Z",
+      end_ts: "2026-08-09T12:00:00Z",
+      summary: "chatting, 10m, active",
+      screen_active: true,
+      interaction: { tap: 2 },
+    }],
     taskerSnapshot: { activity: { current_app: "com.example.chrome" }, health: { location_status: "home" } },
     ...overrides,
   };
@@ -72,7 +78,13 @@ test("new_context plus environment reaches the candidate threshold", () => {
   const first = evaluateEvidence({ bundle: bundle(), previous: {}, now: NOW, longSilenceMs: LONG_SILENCE_MS });
   const result = evaluateEvidence({
     bundle: bundle({
-      companionSegments: [{ start_ts: "2026-08-09T11:58:00Z" }],
+      companionSegments: [{
+        start_ts: "2026-08-09T11:58:00Z",
+        end_ts: "2026-08-09T12:00:00Z",
+        summary: "social browsing, 2m, intermittent",
+        screen_active: true,
+        interaction: {},
+      }],
       taskerSnapshot: { activity: { current_app: "com.example.chrome" }, health: { location_status: "office" } },
     }),
     previous: stateFrom(first),

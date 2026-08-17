@@ -72,6 +72,30 @@ test("ordinary non-sensitive activity and events stay intact", () => {
   });
 });
 
+test("companion summaries and interactions are reduced to safe coarse fields", () => {
+  const result = gate.sanitizeCompanionSegments([
+    {
+      start_ts: "t1",
+      end_ts: "t2",
+      summary: "title=Secret https://example.test/private query=passport",
+      contexts: [{ package: "com.example.notes", title: "Secret" }],
+      interaction: { tap: 2, detail: "raw detail", secret: "drop" },
+    },
+    {
+      start_ts: "t2",
+      end_ts: "t3",
+      summary: "social browsing, 14m, active",
+      contexts: [],
+      interaction: { tap: 3, combo: 1 },
+    },
+  ]);
+  assert.equal(result[0].summary, "activity summary unavailable");
+  assert.deepEqual(result[0].interaction, { tap: 2 });
+  assert.equal(result[1].summary, "social browsing, 14m, active");
+  assert.deepEqual(result[1].interaction, { tap: 3, combo: 1 });
+  assert.doesNotMatch(result[0].summary, /Secret|https|passport|title|query/);
+});
+
 test("filtered fresh context has no package/activity/title/url shape", () => {
   assert.deepEqual(gate.sanitizeClawdContext({
     filtered: true,

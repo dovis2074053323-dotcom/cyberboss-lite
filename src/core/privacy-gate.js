@@ -22,6 +22,10 @@ const BATTERY_KEY = /^(?:battery|battery_level|battery_charging|charging|screen_
 const PACKAGE_TOKEN = /(?:12306|mobileticket|railway|ctrip|qunar|fliggy|travel|flight|airline|hotel|ticket|station|airport|metro|transit|subway|didi|uber|amap|minimap|baidumap|tencentmap|google\.android\.apps\.maps|bank|netbank|creditcard|alipay|unionpay|wallet|pay|password|keeper|1password|bitwarden|lastpass|authenticator|otp|health|medical|clinic|hospital|wechat|com\.tencent\.mm)/i;
 const SENSITIVE_TEXT = /(?:location|latitude|longitude|gps|geofence|coordinates?|address|travel|itinerary|destination|route|station|airport|flight|train|hotel|booking|reservation|ticket|12306|railway|metro|transit|subway|health|medical|clinic|hospital|password|bank|payment|wallet|ssid|bssid|mac|tailscale|forwarded|(?:\d{1,3}\.){3}\d{1,3}|(?:[0-9a-f]{0,4}:){2,}[0-9a-f]{0,4})/i;
 const IP_VALUE = /^(?:(?:\d{1,3}\.){3}\d{1,3}|(?:[0-9a-f]{0,4}:){2,}[0-9a-f]{0,4})$/i;
+const SAFE_COMPANION_SUMMARY = /^(?:social browsing|web browsing|chatting|reading|working|writing|listening to music|taking photos|shopping|watching video|gaming|companion interaction|phone activity|screen off), (?:under \d+m|\d+h(?: \d+m)?|\d+m), (?:active|continuous|intermittent|idle)$/;
+const SAFE_COMPANION_INTERACTION_KEYS = new Set([
+  "tap", "double_tap", "long_press", "fling", "screenshot", "combo", "companion_interaction",
+]);
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -144,6 +148,23 @@ function sanitizeTaskerSnapshot(value) {
   return output;
 }
 
+function sanitizeCompanionSummary(value) {
+  const summary = typeof value === "string" ? value.trim() : "";
+  return SAFE_COMPANION_SUMMARY.test(summary) ? summary : "activity summary unavailable";
+}
+
+function sanitizeCompanionInteraction(value) {
+  if (!isObject(value)) return {};
+  const output = {};
+  for (const [key, raw] of Object.entries(value)) {
+    if (!SAFE_COMPANION_INTERACTION_KEYS.has(key)) continue;
+    const number = typeof raw === "number" && Number.isFinite(raw) ? Math.floor(raw) : null;
+    if (number === null) continue;
+    output[key] = Math.max(0, Math.min(number, 9999));
+  }
+  return output;
+}
+
 function sanitizeCompanionContext(value) {
   if (!isObject(value)) return null;
   const packageName = typeof value.package === "string" ? value.package.trim() : "";
@@ -173,11 +194,12 @@ function sanitizeCompanionSegments(value) {
       const next = copySafeScalar(segment[key]);
       if (next !== undefined) output[key] = next;
     }
+    output.summary = sanitizeCompanionSummary(segment.summary);
     const contexts = Array.isArray(segment.contexts)
       ? segment.contexts.map(sanitizeCompanionContext).filter(Boolean)
       : [];
     output.contexts = contexts;
-    output.interaction = sanitizeStructuredObject(segment.interaction || {});
+    output.interaction = sanitizeCompanionInteraction(segment.interaction || {});
     return output;
   }).filter(Boolean);
 }
@@ -212,6 +234,8 @@ module.exports = {
   setUserBlockedPackages,
   sanitizeClawdContext,
   sanitizeCompanionSegments,
+  sanitizeCompanionSummary,
+  sanitizeCompanionInteraction,
   sanitizeHealthSnapshot,
   sanitizeStructuredObject,
   sanitizeTaskerSnapshot,

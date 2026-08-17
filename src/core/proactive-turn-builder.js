@@ -2,6 +2,7 @@
 // input supplied by the caller after the host lock and budget reservation;
 // the model no longer has a need_context/defer branch that could create a
 // second runtime call.
+const { sanitizeCompanionSummary, sanitizeCompanionInteraction } = require("./privacy-gate");
 
 function buildProactiveTurnPrompt(bundle, { freshContext, forced = false, candidate = null } = {}) {
   const sections = [
@@ -63,14 +64,35 @@ function formatListSection(title, list) {
 
 function formatSegmentsSection(segments) {
   if (!segments || segments.error) {
-    return `Recent companion segments: (unavailable${segments?.error ? ` — ${segments.error}` : ""})`;
+    return `Recent companion timeline: (unavailable${segments?.error ? ` — ${segments.error}` : ""})`;
   }
-  if (!Array.isArray(segments) || segments.length === 0) return "Recent companion segments: (none)";
-  const lines = segments.slice(0, 10).map((segment) => (
-    `- ${segment.start_ts}~${segment.end_ts} screen_active=${segment.screen_active} `
-    + `contexts=${JSON.stringify(segment.contexts || [])} interaction=${JSON.stringify(segment.interaction || {})}`
-  ));
-  return `Recent companion segments:\n${lines.join("\n")}`;
+  if (!Array.isArray(segments) || segments.length === 0) return "Recent companion timeline: (none)";
+  const lines = segments.slice(0, 8).map((segment) => {
+    const start = formatSegmentTime(segment.start_ts);
+    const end = formatSegmentTime(segment.end_ts);
+    const summary = sanitizeCompanionSummary(segment.summary);
+    const interaction = formatInteraction(segment.interaction);
+    return `- ${start}–${end} ${summary}${interaction ? ` (${interaction})` : ""}`;
+  });
+  return `Recent companion timeline:\n${lines.join("\n")}`;
+}
+
+function formatSegmentTime(value) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return String(value ?? "?");
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Shanghai",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).format(date);
+}
+
+function formatInteraction(value) {
+  const safe = sanitizeCompanionInteraction(value);
+  return Object.entries(safe)
+    .map(([key, count]) => `${key}=${count}`)
+    .join(", ");
 }
 
 module.exports = { buildProactiveTurnPrompt };

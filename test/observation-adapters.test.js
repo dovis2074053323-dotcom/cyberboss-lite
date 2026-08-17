@@ -96,12 +96,20 @@ test("tasker-snapshot.getSnapshot fetches both tables and returns first row or n
   }
 });
 
-test("companion-observation.getRecentSegments returns rows with native jsonb (no double-parse needed)", async () => {
+test("companion-observation.getRecentSegments returns the narrative projection without contexts", async () => {
   const stub = stubFetch((url) => {
     assert.match(url, /companion_segments/);
+    assert.match(url, /select=start_ts,end_ts,summary,screen_active,interaction/);
     assert.match(url, /start_ts=gte\.2026-08-09T00%3A00%3A00Z/);
     return jsonResponse([
-      { start_ts: "t1", end_ts: "t2", summary: "ignored", contexts: [{ package: "com.android.chrome" }], screen_active: true, interaction: {} },
+      {
+        start_ts: "t1",
+        end_ts: "t2",
+        summary: "chatting, 10m, active",
+        contexts: [{ package: "com.android.chrome" }],
+        screen_active: true,
+        interaction: { tap: 2, detail: "drop" },
+      },
     ]);
   });
   try {
@@ -111,8 +119,14 @@ test("companion-observation.getRecentSegments returns rows with native jsonb (no
     });
     const rows = await client.getRecentSegments({ sinceIso: "2026-08-09T00:00:00Z" });
     assert.equal(rows.length, 1);
-    assert.deepEqual(rows[0].contexts, [{ package: "com.android.chrome" }]);
-    assert.equal("summary" in rows[0], false);
+    assert.deepEqual(rows[0], {
+      start_ts: "t1",
+      end_ts: "t2",
+      summary: "chatting, 10m, active",
+      screen_active: true,
+      interaction: { tap: 2 },
+    });
+    assert.equal("contexts" in rows[0], false);
   } finally {
     stub.restore();
   }
