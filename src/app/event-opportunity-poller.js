@@ -13,6 +13,7 @@ function createEventOpportunityPoller({
   longSilenceMs,
   evidenceTtlMs = EVIDENCE_TTL_MS,
   canQueueOptional = () => ({ allowed: true }),
+  isEnabled = () => true,
   onMetric = () => {},
   onLog = () => {},
 }) {
@@ -21,6 +22,7 @@ function createEventOpportunityPoller({
 
   async function tick() {
     try {
+      if (!isEnabled()) return { queued: false, reason: "disabled" };
       const previous = stateStore.load();
       const bundle = await buildObservationBundle();
       const now = Date.now();
@@ -72,6 +74,7 @@ function createEventOpportunityPoller({
         }
         return { queued: false, reason: eligibility?.reason || "gate", candidate };
       }
+      if (!isEnabled()) return { queued: false, reason: "disabled", candidate };
 
       const queued = queueStore.enqueue(queueState, {
         id: candidate.id || crypto.randomUUID(),

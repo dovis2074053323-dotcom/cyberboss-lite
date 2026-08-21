@@ -161,7 +161,7 @@ test("a pre-runtime reservation can be released without leaving a phantom call",
   const store = createProactiveBudgetStore(tempConfig());
   const reservation = store.reserveCall({ nowMs: DAY1 });
   assert.equal(reservation.allowed, true);
-  const released = store.releaseCallReservation(reservation);
+  const released = store.releaseCallReservation(reservation, { nowMs: DAY1 });
 
   assert.equal(released.released, true);
   assert.equal(store.load(DAY1).totalCalls, 0);

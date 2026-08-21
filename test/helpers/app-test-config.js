@@ -64,6 +64,7 @@ function tempConfig(overrides = {}) {
     companionSupabaseUrl: "",
     companionSupabaseAnonKey: "",
     systemMessageQueueFile: path.join(stateDir, "system-message-queue.json"),
+    proactiveMessagesEnabledFile: path.join(stateDir, "proactive-messages-enabled.json"),
     proactiveBudgetFile: path.join(stateDir, "proactive-budget.json"),
     eventOpportunityStateFile: path.join(stateDir, "event-opportunity-state.json"),
     eventOpportunityIntervalMs: 20,
@@ -78,7 +79,11 @@ function makePrepared(senderId, text) {
 }
 
 function buildApp(overrides) {
-  const app = new CyberbossApp(tempConfig(overrides));
+  const config = tempConfig(overrides);
+  const app = new CyberbossApp(config);
+  // Existing app behavior tests exercise the enabled path explicitly. The
+  // production store itself still defaults to OFF and has no env bypass.
+  if (overrides?.proactiveMessagesEnabled !== false) app.setProactiveMessagesEnabled(true);
   // Neutralize the network side effect bufferInboundMessage fires on every
   // call — sendTyping isn't what these tests are about, and there's no real
   // WeChat account behind this config.

@@ -323,6 +323,15 @@ function createProactiveBudgetStore(config, options = {}) {
     return load(nowMs).slots.filter((slot) => typeof slot.deliveryText === "string" && slot.deliveryText.trim());
   }
 
+  function clearPendingDeliveries(nowMs = nowProvider()) {
+    const state = load(nowMs);
+    const changed = state.slots.some((slot) => typeof slot.deliveryText === "string" && slot.deliveryText.trim());
+    if (!changed) return { state, changed: false };
+    const next = { ...state, slots: state.slots.map((slot) => ({ ...slot, deliveryText: null })) };
+    save(next);
+    return { state: next, changed: true };
+  }
+
   function markExpiredSlots(nowMs = nowProvider()) {
     const state = load(nowMs);
     let missed = 0;
@@ -352,6 +361,7 @@ function createProactiveBudgetStore(config, options = {}) {
     markOptionalMessageSent,
     recordDeliveryFailure,
     pendingDeliveries,
+    clearPendingDeliveries,
     markExpiredSlots,
     getSlot,
     localDateKey,

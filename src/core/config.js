@@ -91,6 +91,7 @@ function readConfig() {
     contextSnapshotTimeoutMs: readIntEnv("CYBERBOSS_CONTEXT_SNAPSHOT_TIMEOUT_MS") || 15_000,
 
     systemMessageQueueFile: path.join(stateDir, "system-message-queue.json"),
+    proactiveMessagesEnabledFile: path.join(stateDir, "proactive-messages-enabled.json"),
     proactiveBudgetFile: path.join(stateDir, "proactive-budget.json"),
 
     // Event Opportunity: fixed low-frequency poll with a 30-minute rolling

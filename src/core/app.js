@@ -19,6 +19,7 @@ const { createCompanionObservationClient } = require("../adapters/observation/co
 const { createMorrowContextRelay } = require("../adapters/observation/morrow-context-relay");
 const { createObservationBundleBuilder } = require("./observation-bundle");
 const { createSystemMessageQueueStore } = require("./system-message-queue-store");
+const { createProactiveMessagesEnabledStore } = require("./proactive-messages-enabled-store");
 const { createEventOpportunityStateStore } = require("./event-opportunity-state-store");
 const { createEventOpportunityPoller } = require("../app/event-opportunity-poller");
 const { createProactiveBudgetStore } = require("./proactive-budget-store");
@@ -62,6 +63,7 @@ class CyberbossApp {
     // calls happen only after a queued candidate passes the drain gates.
     this.pulseTimer = null;
     this.pulseTickInFlight = false;
+    this.started = false;
 
     // Session 4 (Cyberboss Proactive + keke-overflow Companion rework, task
     // #14): observation sources are optional at boot — CYBERBOSS_TASKER_*/
@@ -84,6 +86,7 @@ class CyberbossApp {
     // Event Opportunity and mandatory outreach slots share one queue and one
     // drain consumer. Both producers remain zero-model local schedulers.
     this.systemMessageQueueStore = createSystemMessageQueueStore(config);
+    this.proactiveMessagesEnabledStore = createProactiveMessagesEnabledStore(config);
     this.proactiveBudgetStore = createProactiveBudgetStore(config);
     this.eventOpportunityStateStore = createEventOpportunityStateStore(config);
     this.eventOpportunityPoller = createEventOpportunityPoller({
@@ -93,10 +96,55 @@ class CyberbossApp {
       intervalMs: config.eventOpportunityIntervalMs,
       longSilenceMs: config.eventOpportunityLongSilenceMs,
       evidenceTtlMs: config.proactiveEvidenceTtlMs,
-      canQueueOptional: () => this.proactiveBudgetStore.getOptionalEligibility(),
+      canQueueOptional: () => this.isProactiveMessagesEnabled()
+        ? this.proactiveBudgetStore.getOptionalEligibility()
+        : { allowed: false, reason: "proactive_messages_disabled" },
+      isEnabled: () => this.isProactiveMessagesEnabled(),
       onMetric: (metric) => this.proactiveBudgetStore.recordMetric(metric),
       onLog: (msg) => console.log(`[cyberboss] ${msg}`),
     });
+  }
+
+  isProactiveMessagesEnabled() {
+    return this.proactiveMessagesEnabledStore.isEnabled();
+  }
+
+  clearDisabledProactiveState() {
+    const queueState = this.systemMessageQueueStore.load();
+    const next = this.systemMessageQueueStore.removeWhere(queueState, (message) => message.source !== "reminder");
+    if (next.messages.length !== queueState.messages.length) this.systemMessageQueueStore.save(next);
+    // Mandatory delivery text is itself an unsent proactive message. It must
+    // not survive an OFF transition and be retried by the next pulse.
+    if (typeof this.proactiveBudgetStore.clearPendingDeliveries === "function") {
+      this.proactiveBudgetStore.clearPendingDeliveries();
+    }
+    return {
+      removedQueueMessages: queueState.messages.length - next.messages.length,
+    };
+  }
+
+  setProactiveMessagesEnabled(enabled) {
+    const state = this.proactiveMessagesEnabledStore.setEnabled(enabled === true);
+    if (!state.enabled) {
+      this.clearDisabledProactiveState();
+      this.eventOpportunityPoller.stop();
+    } else if (this.started) {
+      this.eventOpportunityPoller.start();
+    }
+    return state.enabled;
+  }
+
+  // Compatibility seam for the retired --checkin/system-checkin-poller
+  // entrypoint. The current Event Opportunity producer may start only through
+  // the durable master gate; argv/env cannot turn it on.
+  startWithCheckin() {
+    if (!this.isProactiveMessagesEnabled()) {
+      this.clearDisabledProactiveState();
+      this.eventOpportunityPoller.stop();
+      return false;
+    }
+    this.eventOpportunityPoller.start();
+    return true;
   }
 
   printDoctor() {
@@ -151,12 +199,14 @@ class CyberbossApp {
     this.logProactiveDayState();
     console.log("[cyberboss] bridge loop started; waiting for WeChat messages.");
 
+    this.started = true;
     this.startPulse();
-    this.eventOpportunityPoller.start();
+    this.startWithCheckin();
 
     const shutdown = createShutdownController(async () => {
       this.clearMergeTimers();
       this.stopPulse();
+      this.started = false;
       this.eventOpportunityPoller.stop();
     });
 
@@ -189,6 +239,7 @@ class CyberbossApp {
       shutdown.dispose();
       this.clearMergeTimers();
       this.stopPulse();
+      this.started = false;
       this.eventOpportunityPoller.stop();
     }
   }
@@ -245,11 +296,19 @@ class CyberbossApp {
   }
 
   async retryMandatoryDeliveries() {
+    if (!this.isProactiveMessagesEnabled()) {
+      this.clearDisabledProactiveState();
+      return { retried: false, reason: "proactive_messages_disabled" };
+    }
     const allowedSenderId = this.senderGate.getAllowedSenderId();
     if (!allowedSenderId) return { retried: false, reason: "no_allowed_sender" };
     const pending = this.proactiveBudgetStore.pendingDeliveries();
     const results = [];
     for (const slot of pending) {
+      if (!this.isProactiveMessagesEnabled()) {
+        this.clearDisabledProactiveState();
+        break;
+      }
       try {
         await this.channelAdapter.sendText({ userId: allowedSenderId, text: slot.deliveryText });
         this.proactiveBudgetStore.markSlotSatisfied(slot.id);
@@ -280,6 +339,10 @@ class CyberbossApp {
   }
 
   async runMandatorySlotCheck(nowMs = Date.now()) {
+    if (!this.isProactiveMessagesEnabled()) {
+      this.clearDisabledProactiveState();
+      return { queued: false, reason: "proactive_messages_disabled" };
+    }
     const expired = this.proactiveBudgetStore.markExpiredSlots(nowMs);
     for (const slotId of expired.missed) {
       const queueState = this.systemMessageQueueStore.load();
@@ -332,6 +395,7 @@ class CyberbossApp {
   // budget gate. The observation bundle and fresh Clawd context are rebuilt
   // only after both gates pass.
   async runProactiveDrainTick() {
+    if (!this.isProactiveMessagesEnabled()) this.clearDisabledProactiveState();
     const queueState = this.systemMessageQueueStore.load();
     if (!this.systemMessageQueueStore.hasPending(queueState)) {
       return { drained: false, reason: "empty" };
@@ -343,6 +407,9 @@ class CyberbossApp {
     }
 
     const first = this.systemMessageQueueStore.peek(queueState);
+    if (!this.isProactiveMessagesEnabled() && first?.source !== "reminder") {
+      return { drained: false, reason: "proactive_messages_disabled" };
+    }
     const nowMs = Date.now();
     const createdAtMs = new Date(first.createdAt).getTime();
     if (!first.forced && Number.isFinite(createdAtMs) && nowMs - createdAtMs > this.config.proactiveEvidenceTtlMs) {
@@ -380,6 +447,10 @@ class CyberbossApp {
       const currentQueueState = this.systemMessageQueueStore.load();
       const message = this.systemMessageQueueStore.peek(currentQueueState);
       if (!message) return { drained: false, reason: "empty_after_lock" };
+      if (!this.isProactiveMessagesEnabled() && message.source !== "reminder") {
+        this.clearDisabledProactiveState();
+        return { drained: false, reason: "proactive_messages_disabled" };
+      }
 
       reservation = this.proactiveBudgetStore.reserveCall({ forced, nowMs: Date.now() });
       if (!reservation.allowed) {
@@ -390,7 +461,17 @@ class CyberbossApp {
       }
 
       const bundle = await this.observationBundleBuilder.build();
+      if (!this.isProactiveMessagesEnabled() && message.source !== "reminder") {
+        if (reservation?.reserved && !runtimeStarted) this.proactiveBudgetStore.releaseCallReservation(reservation);
+        this.clearDisabledProactiveState();
+        return { drained: false, reason: "proactive_messages_disabled" };
+      }
       const freshContext = await this.requestFreshProactiveContext();
+      if (!this.isProactiveMessagesEnabled() && message.source !== "reminder") {
+        if (reservation?.reserved && !runtimeStarted) this.proactiveBudgetStore.releaseCallReservation(reservation);
+        this.clearDisabledProactiveState();
+        return { drained: false, reason: "proactive_messages_disabled" };
+      }
       const prompt = require("./proactive-turn-builder").buildProactiveTurnPrompt(bundle, {
         freshContext,
         forced,
@@ -403,19 +484,25 @@ class CyberbossApp {
       const result = await processProactiveMessage({ ...message, bundle, freshContext }, {
         prompt,
         callRuntime: (text) => {
+          if (!this.isProactiveMessagesEnabled() && message.source !== "reminder") {
+            throw new Error("proactive messages disabled");
+          }
           runtimeStarted = true;
           return this.runtimeAdapter.sendSingleTurn({
             text,
             resultSchema: forced ? MANDATORY_PROACTIVE_RESULT_JSON_SCHEMA : PROACTIVE_RESULT_JSON_SCHEMA,
           });
         },
-        sendMessage: (text) => this.channelAdapter.sendText({ userId: allowedSenderId, text }).then(() => true).catch((error) => {
+        sendMessage: (text) => {
+          if (!this.isProactiveMessagesEnabled() && message.source !== "reminder") return false;
+          return this.channelAdapter.sendText({ userId: allowedSenderId, text }).then(() => true).catch((error) => {
           console.error(`[cyberboss] proactive send failed: ${formatErrorMessage(error)}`);
           return false;
-        }),
+          });
+        },
         markAgentMessageSent: (nowIso) => this.markAgentMessageSent(nowIso),
         onDeliveryFailed: (text) => {
-          if (forced && message.slotId) this.proactiveBudgetStore.recordDeliveryFailure(message.slotId, text);
+          if (this.isProactiveMessagesEnabled() && forced && message.slotId) this.proactiveBudgetStore.recordDeliveryFailure(message.slotId, text);
         },
         onLog: (msg) => console.log(`[cyberboss] ${msg}`),
       });

@@ -10,10 +10,32 @@ function defaultStoreState() {
   return { messages: [] };
 }
 
-function normalizeMessage(message) {
+const SYSTEM_MESSAGE_SOURCES = Object.freeze([
+  "checkin",
+  "location",
+  "reminder",
+  "event_opportunity",
+  "mandatory_slot",
+  "stochastic_pulse",
+  "legacy",
+]);
+
+function inferLegacySource(id) {
+  const value = String(id || "").trim().toLowerCase();
+  if (/remind(?:er)?|intention/.test(value)) return "reminder";
+  if (/location|movement|geofence|geo/.test(value)) return "location";
+  if (/check[ _-]?in|stochastic|pulse/.test(value)) return "checkin";
+  // Unknown old records are proactive by default. It is safer to discard an
+  // ambiguous active candidate on OFF than to deliver it after the user closed
+  // the master gate.
+  return "legacy";
+}
+
+function normalizeMessage(message, { allowLegacySource = false } = {}) {
   if (!message || typeof message !== "object") return null;
   const id = String(message.id || "").trim();
-  const source = String(message.source || "").trim();
+  const rawSource = String(message.source || "").trim();
+  const source = rawSource || (allowLegacySource ? inferLegacySource(id) : "");
   const createdAt = String(message.createdAt || "").trim();
   if (!id || !source || !createdAt) return null;
   const normalized = {
@@ -39,7 +61,7 @@ function createSystemMessageQueueStore(config) {
     const raw = readJsonStore(filePath, defaultStoreState);
     const { schemaVersion, updatedAt, ...rest } = raw;
     const messages = Array.isArray(rest.messages)
-      ? rest.messages.map(normalizeMessage).filter(Boolean)
+      ? rest.messages.map((message) => normalizeMessage(message, { allowLegacySource: true })).filter(Boolean)
       : [];
     return { messages };
   }
@@ -83,7 +105,20 @@ function createSystemMessageQueueStore(config) {
     return { drained: Array.isArray(state?.messages) ? state.messages : [], state: { ...state, messages: [] } };
   }
 
-  return { load, save, enqueue, hasPending, peek, takeFirst, replaceFirst, removeWhere, drainAll, normalizeMessage };
+  return {
+    load,
+    save,
+    enqueue,
+    hasPending,
+    peek,
+    takeFirst,
+    replaceFirst,
+    removeWhere,
+    drainAll,
+    normalizeMessage,
+    inferLegacySource,
+    sources: SYSTEM_MESSAGE_SOURCES,
+  };
 }
 
-module.exports = { createSystemMessageQueueStore, normalizeMessage };
+module.exports = { createSystemMessageQueueStore, normalizeMessage, inferLegacySource, SYSTEM_MESSAGE_SOURCES };
