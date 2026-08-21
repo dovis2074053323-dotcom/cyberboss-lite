@@ -1,0 +1,28 @@
+[Unit]
+Description=WeChat Claude bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wechatbot
+Group=wechatbot
+WorkingDirectory=/srv/wechat-claude-bot/app
+Environment=HOME=/home/wechatbot
+Environment=NODE_ENV=production
+EnvironmentFile=/etc/wechat-claude-bot.env
+ExecStart=/usr/bin/node bin/wechat-claude.js start
+Restart=always
+RestartSec=5
+
+MemoryHigh=300M
+MemoryMax=450M
+PrivateTmp=true
+# The ACL helper is deliberately one fixed, argument-less sudo rule.
+NoNewPrivileges=false
+
+StandardOutput=append:/srv/wechat-claude-bot/state/wechat-claude-bot.log
+StandardError=append:/srv/wechat-claude-bot/state/wechat-claude-bot.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,34 +1,36 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-// Spec §9 test 14: scheduled intentions (real reminder/check_in proactive
-// sending) must default to off. Runs readConfig() with the env var unset/set
-// in a child process so it doesn't leak into (or get polluted by) this
-// process's own env across other test files.
-const { execFileSync } = require("child_process");
-const path = require("path");
+const { readConfig } = require("../src/config");
 
-function readConfigEnableScheduledIntentions(envValue) {
-  const script = `
-    const { readConfig } = require(${JSON.stringify(path.resolve(__dirname, "..", "src", "core", "config.js"))});
-    process.stdout.write(String(readConfig().enableScheduledIntentions));
-  `;
-  const env = { ...process.env };
-  if (envValue === undefined) {
-    delete env.CYBERBOSS_ENABLE_SCHEDULED_INTENTIONS;
-  } else {
-    env.CYBERBOSS_ENABLE_SCHEDULED_INTENTIONS = envValue;
-  }
-  const output = execFileSync(process.execPath, ["-e", script], { env, encoding: "utf8" });
-  return output.trim();
-}
+test("config exposes only the single-turn bot runtime", () => {
+  const config = readConfig(["start"], {
+    WECHAT_CLAUDE_STATE_DIR: "/srv/wechat-claude-bot/state",
+    WECHAT_CLAUDE_RUNTIME_DIR: "/srv/wechat-claude-bot/runtime",
+    WECHAT_CLAUDE_CONFIG_DIR_ROOT: "/srv/wechat-claude-bot/state/claude-cfg",
+    WECHAT_CLAUDE_ALLOWED_SENDER_ID: "sender-1",
+    WECHAT_CLAUDE_ACCOUNT_ID: "main",
+    WECHAT_CLAUDE_HOST_LOCK_DIR: "/run/agent-runtime",
+    WECHAT_CLAUDE_HOST_LOCK_WAIT_MS: "1234",
+  });
 
-test("enableScheduledIntentions defaults to false when the env var is unset", () => {
-  assert.equal(readConfigEnableScheduledIntentions(undefined), "false");
+  assert.equal(config.mode, "start");
+  assert.equal(config.stateDir, "/srv/wechat-claude-bot/state");
+  assert.equal(config.runtimeDir, "/srv/wechat-claude-bot/runtime");
+  assert.equal(config.allowedSenderId, "sender-1");
+  assert.equal(config.accountId, "main");
+  assert.equal(config.hostLockWaitMs, 1234);
+  assert.equal(["work", "space", "Root"].join("") in config, false);
+  assert.equal("systemPromptFile" in config, false);
+  assert.equal("contextTokenFile" in config, false);
+  assert.equal("memoryFile" in config, false);
 });
 
-test("enableScheduledIntentions is true only when explicitly set", () => {
-  assert.equal(readConfigEnableScheduledIntentions("true"), "true");
-  assert.equal(readConfigEnableScheduledIntentions("1"), "true");
-  assert.equal(readConfigEnableScheduledIntentions("false"), "false");
+test("config defaults to bot-owned state and runtime paths", () => {
+  const config = readConfig([], {});
+  assert.equal(config.mode, "help");
+  assert.match(config.stateDir, /\.wechat-claude-bot$/u);
+  assert.equal(config.runtimeDir, `${config.stateDir}/runtime`);
+  assert.equal(config.claudeConfigDirRoot, `${config.stateDir}/claude-cfg`);
+  assert.equal(config.weixinBaseUrl, "https://ilinkai.weixin.qq.com");
 });

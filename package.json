@@ -1,28 +1,27 @@
 {
-  "name": "cyberboss",
+  "name": "wechat-claude-bot",
   "version": "0.1.0",
-  "description": "A personal agent bridge core for life operations.",
+  "description": "A single-turn WeChat bot backed by Claude Code OAuth.",
   "license": "AGPL-3.0-only",
   "private": false,
   "type": "commonjs",
   "main": "src/index.js",
   "bin": {
-    "cyberboss": "./bin/cyberboss.js"
+    "wechat-claude": "./bin/wechat-claude.js"
   },
   "engines": {
     "node": ">=22"
   },
   "scripts": {
-    "start": "node ./bin/cyberboss.js start",
-    "login": "node ./bin/cyberboss.js login",
-    "doctor": "node ./bin/cyberboss.js doctor",
-    "help": "node ./bin/cyberboss.js help",
+    "start": "node ./bin/wechat-claude.js start",
+    "login": "node ./bin/wechat-claude.js login",
+    "doctor": "node ./bin/wechat-claude.js doctor",
+    "help": "node ./bin/wechat-claude.js help",
     "check": "find src bin -name '*.js' -exec node --check {} +",
     "test": "node --test \"test/*.test.js\""
   },
   "dependencies": {
     "dotenv": "^16.4.7",
-    "qrcode-terminal": "0.12.0",
-    "ws": "^8.19.0"
+    "qrcode-terminal": "0.12.0"
   }
 }
